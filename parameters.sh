@@ -1,0 +1,10 @@
+DOMAIN=""
+SELF_SIGNED="1"
+NUMBITS=2048
+TIME=3650
+CONFIGURATION_FILE=""
+SUBJECT=""
+SUBJECT_CA="/C=PT/ST=Drommund Kaas/L=Kaas City/O=Sith Empire/OU=Imperial Intelligence/CN=Death-Star"
+TEMPLATE="0"
+CRT_FILE=""
+PRIVATE_KEY=""
