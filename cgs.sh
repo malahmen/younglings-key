@@ -36,10 +36,10 @@ if [ -z "$CRT_FILE" && -z "$PRIVATE_KEY" ]; then
   exit 0
 fi
 
-validate_domain $DOMAIN
+validate_domain "$DOMAIN"
 
 # if we want to generate a .cfg template file, ignore everything else.
-validate_template_flag
+validate_template_flag "$TEMPLATE"
 if [ "$TEMPLATE" -eq 1 ]; then
   # generate configuration template file and exit
   generate_configuration_file_template
