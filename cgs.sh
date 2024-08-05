@@ -24,6 +24,9 @@ $SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Read parameters from command line
 read_parameters "$@"
 
+# enabling error handling
+trap execution_error ERR
+
 # if we only want to generate .pem and .cert from a .crt file, we ignore everything else.
 if [ -z "$CRT_FILE" && -z "$PRIVATE_KEY" ]; then
   # generate files from .crt and exit
@@ -45,9 +48,6 @@ fi
 
 validate_self_signed $SELF_SIGNED
 validate_configuration_file $CONFIGURATION_FILE
-
-# enabling error handling
-trap execution_error ERR
 
 # decide which protocols to follow
 if [ "$SELF_SIGNED" -eq 1 ]; then
