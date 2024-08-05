@@ -1,1 +1,3 @@
 CERTIFICATES_DIR="certificates"
+PEM_AND_CERT_FILES="pem_and_cert_files"
+CONFIGURATION_FILE_TEMPLATE="configuration_file_template"
