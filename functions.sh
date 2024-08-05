@@ -12,6 +12,9 @@ display_usage() {
     -f CONFIGURATION_FILE  Set the name of the external configuration file (ignores the subject option)
     -i SUBJECT             Set the subject string for the certificate (ignores the configuration file option)
     -a SUBJECT_CA          Set the subject string for the certificate authority if self-signed
+    -g TEMPLATE            Generate a configuration file template (needs a domain parameter)
+    -k PRIVATE_KEY         Set the name of the .KEY file to use for generating a .PEM file.
+    -r CRT_FILE            Set the name of the .CRT file to use for generating a .PEM file.
 EOF
 }
 
@@ -54,7 +57,7 @@ execution_error() {
     if [ -n "$err_code" ]; then
         oerr "$err_code"
     fi
-    oerr "$ERR_SE"
+    oerr "$ERR_EE"
     exit 1
 }
 
@@ -117,25 +120,32 @@ read_parameters() {
   done
 }
 
+# Function: validates a domain name parameter.
+# Usage example:
+# validate_domain "$DOMAIN"
 validate_domain() {
     local domain="$1"
     if [ -z "$domain" ]; then
-        parameter_missing_error "$ERR_DNNS"
+        parameter_missing_error "$ERR_DN_NS"
     fi
     if ! echo "$domain" | grep -Eq '^([a-zA-Z0-9](-*[a-zA-Z0-9])*\.)+[a-zA-Z]{2,63}$'; then
-        execution_error "$ERR_DNI"
+        execution_error "$ERR_DN_I"
     fi
 }
 
+# Function: validates the configuration file generation flag.
+# Checks if is set and if the value is valid.
+# Usage example:
+# validate_template_flag "$TEMPLATE"
 validate_template_flag() {
     local generate=$1
     if [ -z "$generate" ]; then
         # must be set - maybe with a default value
-        parameter_missing_error "$ERR_TPL_FNS"
+        parameter_missing_error "$ERR_TPLF_NS"
     fi
     if ! echo "$port" | grep -qE '^[01]$'; then
         # must be 0 or 1
-        execution_error "$ERR_TPL_FIV"
+        execution_error "$ERR_TPLF_I"
     fi
 }
 
@@ -143,25 +153,25 @@ validate_self_signed() {
     local signed=$1
     if [ -z "$signed" ]; then
         # must be set - maybe with a default value
-        parameter_missing_error "$ERR_SSFNS"
+        parameter_missing_error "$ERR_SSF_NS"
     fi
     if ! echo "$port" | grep -qE '^[01]$'; then
         # must be 0 or 1
-        execution_error "$ERR_SSFIV"
+        execution_error "$ERR_SSF_I"
     fi
 }
 
 validate_numbits() {
     local numbits="$1"
     if !echo "$numbits" | grep -Eq '^(2048|3072|4096)$'; then
-        execution_error "$ERR_INB"
+        execution_error "$ERR_BN_I"
     fi
 }
 
 validate_duration() {
     local days="$1"
     if ! echo "$days" | grep -Eq '^[0-9]+$' && [ "$days" -ge 1 ] && [ "$days" -le 3650 ]; then
-        execution_error "$ERR_INOD"
+        execution_error "$ERR_CD_I"
     fi
 }
 
@@ -172,12 +182,12 @@ validate_duration() {
 validate_configuration_file(){
   local config_file_name=$1
     if [ -z "$config_file_name" ]; then
-        parameter_missing_error "$ERR_CFNS"
+        parameter_missing_error "$ERR_CFG_FNS"
     fi
     local config_file_path=$(eval echo "$config_file_name")
     msg "Verifying configuration file: $config_file_path"
     if [ ! -f "$config_file_path" ]; then
-        execution_error "$ERR_CFNE"
+        execution_error "$ERR_CFG_FNF"
     fi
     msg "Loading configurations."
     $CONFIGURATIONS=$(cat "$config_file_path")
@@ -208,11 +218,11 @@ validate_subject(){
   if echo "$subject_string" | grep -Eq "$re_subject"; then
     if !is_present "$subject_string" "/C=" || !is_present "$subject_string" "/CN=" || !is_present "$subject_string" "/O="; then
       # does not have the required fields
-      execution_error "$ERR_SSMF"
+      execution_error "$ERR_SS_MI"
     fi
   else
     # its garbled
-    execution_error "$ERR_ISS"
+    execution_error "$ERR_SS_I"
   fi
 }
 
@@ -259,11 +269,11 @@ generate_files_from_crt(){
 
   # validate .CRT file exists
   if [ ! -f "$CERTIFICATES_PATH/$CRT_FILE" ]; then
-        execution_error "$ERR_CRT_FNE"
+        execution_error "$ERR_CRT_FNF"
   fi
   # validate .KEY file exists
   if [ ! -f "$CERTIFICATES_PATH/$PRIVATE_KEY" ]; then
-        execution_error "$ERR_KEY_FNE"
+        execution_error "$ERR_KEY_FNF"
   fi
   # Check it
   execute openssl x509 -text -noout -in "$CERTIFICATES_PATH/$CRT_FILE"
