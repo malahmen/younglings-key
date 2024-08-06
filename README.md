@@ -1,7 +1,9 @@
 # Certificate Generation Script (CGS)
 
 ## Description
-The Certificate Generation Script (CGS) is a versatile tool designed to streamline the management and generation of web certificates. It simplifies the process of creating certification requests, self-signed certificates, and more, making it ideal for developers and system administrators.
+The Certificate Generation Script (CGS) is a versatile tool designed to streamline the management and generation of web certificates. 
+
+It simplifies the process of creating certification requests, self-signed certificates, and more, making it ideal for developers and system administrators.
 
 ## Installation
 Follow these steps to install the CGS on your system:
