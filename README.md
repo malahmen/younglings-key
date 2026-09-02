@@ -1,84 +1,108 @@
-# Certificate Generation Script (CGS)
+# younglings-key
 
-## Description
-The Certificate Generation Script (CGS) is a versatile tool designed to streamline the management and generation of web certificates. 
+**`ignite.sh` — certificate generation, simplified.**
 
-It simplifies the process of creating certification requests, self-signed certificates, and more, making it ideal for developers and system administrators.
+A small, gum-free, **flag-driven** CLI around `openssl`. It generates certificate
+signing requests, self-signed certificates (with their own CA), ready-to-edit
+`openssl` config templates, and `.cert`/`.pem` files from an existing `.crt` — with
+no interactive prompts, so it drops straight into scripts and pipelines.
 
 ## Capabilities
 
-- **Certificate Requests:** Generate CSR files to submit to certificate authorities.
-- **Self-Signed Certificates:** Create certificates for local development and testing.
-- **Certificate and Key Management:** Generate `.cert` and `.pem` files from existing certificate and key files.
-- **Configurable Templates:** Use customizable templates instead of manual subject strings for requests.
+- **Self-signed certificates** — creates a CA and signs the certificate with it (great for local dev/testing).
+- **Certificate requests (CSR)** — generates a key + CSR to send to a certificate authority.
+- **Config templates** — writes an `openssl` `.cfg` template for a domain that you can edit and reuse.
+- **Format conversion** — produces `.cert` (and `.pem`, given the key) from an existing `.crt`.
+
+Output is written under **`./certificates/`** in the current directory.
+
+## Requirements
+
+- **`openssl`** — the only hard dependency (checked at start).
+- **`bash`** — the script uses `#!/usr/bin/env bash` with strict mode.
+
+No elevated privileges are needed; it writes only under the working directory.
+
+## Install
+
+```sh
+git clone git@github.com:malahmen/younglings-key.git
+cd younglings-key
+chmod +x ignite.sh
+./ignite.sh -h
+```
 
 ## Usage
 
-### Installation
-Follow these steps to install the CGS on your system:
-
 ```sh
-# Clone the repository
-git clone git@github.com:malahmen/cgs.git
+# 1) Write a config template for your domain (then edit ./certificates/example.com.cfg)
+./ignite.sh -d example.com -g 1
 
-# Navigate to the cloned directory
-cd cgs
+# 2) Self-signed certificate from a subject string (default mode: -s 1)
+./ignite.sh -d example.com \
+  -i "/C=PT/O=Acme/CN=example.com" \
+  -a "/C=PT/O=Acme/CN=Acme Root CA" -t 365
 
-# Give it permitions to execute
-chmod +x cgs.sh
+# 3) Self-signed certificate driven by a config file
+./ignite.sh -d example.com \
+  -f ./certificates/example.com.cfg \
+  -a "/C=PT/O=Acme/CN=Acme Root CA"
 
-# There are no dependencies to install, proceed to usage
-```
-### Execution
+# 4) CSR only, to submit to a CA (no signing)
+./ignite.sh -d example.com -s 0 -i "/C=PT/O=Acme/CN=example.com"
 
-Execute the script with the desired options:
-
-```sh
-# Generate a configuration file for your domain
-./cgs.sh -d my-domain.com -g 1
-
-# Customize the generated my-domain.cfg file as needed
-
-# Generate a CSR using the customized configuration file
-./cgs.sh -d my-domain.com -f my-domain.cfg
+# 5) Convert an existing .crt into .cert (+ .pem when a key is given)
+./ignite.sh -d example.com -r example.com.crt -k example.com.key
 ```
 
 ## Options
 
-- `-d` <**DOMAIN**>: Set the domain to get certified
-- `-s` <**SELF_SIGNED**>: Set the certificate to be self-signed (0/1)
-- `-n` <**NUMBITS**>: Set the value of bits to be used in the generation process
-- `-t` <**DURATION**>: Set the duration of the certificate in days
-- `-f` <**CONFIGURATION_FILE**>: Set the name of the external configuration file (ignores the subject option)
-- `-i` <**SUBJECT**>: Set the subject string for the certificate (ignores the configuration file option)
-- `-a` <**SUBJECT_CA**>: Set the subject string for the certificate authority if self-signed
-- `-g` <**TEMPLATE**>: Generate a configuration file template (0/1, needs a domain parameter)
-- `-k` <**PRIVATE_KEY**>: Set the name of the .KEY file to use for generating a .PEM file
-- `-r` <**CRT_FILE**>: Set the name of the .CRT file to use for generating a .PEM file
+| Flag | Meaning | Default |
+| ---- | ------- | ------- |
+| `-d DOMAIN` | Domain to certify (e.g. `example.com`) — **required** | — |
+| `-s SELF_SIGNED` | `1` = self-signed, `0` = CSR only | `1` |
+| `-n NUMBITS` | RSA key size: `2048`, `3072`, or `4096` | `2048` |
+| `-t DURATION` | Validity in days for self-signed certs (`1`–`3650`) | `3650` |
+| `-f CONFIGURATION_FILE` | `openssl` config file (mutually exclusive with `-i`; if both, `-f` wins) | — |
+| `-i SUBJECT` | Subject string, e.g. `/C=PT/O=Acme/CN=example.com` | — |
+| `-a SUBJECT_CA` | CA subject string (self-signed only) | a placeholder CA |
+| `-g TEMPLATE` | `1` = write a `.cfg` template for the domain and exit | `0` |
+| `-k PRIVATE_KEY` | `.key` file to pair with `-r` when building a `.pem` | — |
+| `-r CRT_FILE` | `.crt` file to convert into `.cert` (and `.pem` with `-k`) | — |
+| `-h` | Show help and exit | — |
 
-## Files
-- `cgs.sh`: The main generation script.
-- `colors.sh`: Terminal colors to enhance the user interface.
-- `constants.sh`: Configuration constants used throughout the script.
-- `errors.sh`: Error messages and handling for better troubleshooting.
-- `functions.sh`: Houses various functions used in the script for different tasks.
-- `parameters.sh`: Default values for parameters used in the installation process.
-- `protocols.sh`: Holds the execution flow for each feature.
-- `regex.sh`: Regular expressions used are declared here.
-- `variables.sh`: Variables required for the script, dependent on constants and parameters.
+**Subject strings** are a run of `/Key=Value` pairs in any order and must include at
+least `/C=`, `/O=`, and `/CN=` (e.g. `/C=PT/ST=Lisboa/O=Acme/OU=IT/CN=example.com`).
+
+## Output files
+
+For a domain `example.com`, `./certificates/` will contain, depending on the mode:
+
+- **CSR mode**: `example.com.key`, `example.com.csr`
+- **Self-signed**: `ca.key`, `ca.crt`, `example.com.key`, `example.com.csr`,
+  `example.com.crt`, `example.com.cert`, `example.com.pem`
+- **Template**: `example.com.cfg`
+- **Conversion**: `example.com.cert` (+ `example.com.pem` when `-k` is given)
+
+## Project layout
+
+| File | Purpose |
+| ---- | ------- |
+| `ignite.sh` | Main entry point — parses flags, validates, dispatches. |
+| `functions.sh` | Helpers and validators (usage, colour output, parameter validation). |
+| `protocols.sh` | The generation flows (self-signed, CSR, template, conversion). |
+| `parameters.sh` | Default parameter values. |
+| `constants.sh` | Configuration constants. |
+| `variables.sh` | Derived variables (output path). |
+| `regex.sh` | Validation regular expressions. |
+| `errors.sh` | Error message strings. |
+| `colors.sh` | Terminal colour codes. |
 
 ## Contributing
-Contributions are welcome! Here's how you can contribute:
 
-```sh
-# Fork the repository
-# Create a new branch for your feature or fix
-# Make your changes
-# Submit a pull request for review
-```
+Fork → branch → change → PR. Please keep it `openssl`-only and flag-driven (no
+interactive prompts), so it stays scriptable.
 
 ## License
-This project is released under the [unlicense](LICENSE.md). See the LICENSE file for more details.
 
-## Acknowledgments
-Special thanks to the contributors and supporters of the CGS project, whose efforts have made this tool more effective and accessible.(Me and my ego so far.)
+Released under the [Unlicense](LICENSE).
