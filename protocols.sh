@@ -117,6 +117,9 @@ generate_files_from_crt_protocol() {
     local crt_path="$CRT_FILE"
     [ -f "$crt_path" ] || crt_path="$CERTIFICATES_PATH/$CRT_FILE"
     [ -f "$crt_path" ] || execution_error "$ERR_CRT_FNF"
+    # Fail clearly on the wrong file (e.g. a .cfg) instead of dumping openssl's
+    # decoder errors when it can't parse a certificate.
+    grep -q "BEGIN CERTIFICATE" "$crt_path" || execution_error "$ERR_CRT_NC"
 
     execute openssl x509 -text -noout -in "$crt_path"
     execute openssl x509 -inform PEM -in "$crt_path" -out "$CERTIFICATES_PATH/$DOMAIN.cert"
@@ -126,6 +129,7 @@ generate_files_from_crt_protocol() {
         local key_path="$PRIVATE_KEY"
         [ -f "$key_path" ] || key_path="$CERTIFICATES_PATH/$PRIVATE_KEY"
         [ -f "$key_path" ] || execution_error "$ERR_KEY_FNF"
+        grep -q "PRIVATE KEY" "$key_path" || execution_error "$ERR_KEY_NK"
         execute cat "$key_path" "$crt_path" > "$CERTIFICATES_PATH/$DOMAIN.pem"
         msg "Generated: $CERTIFICATES_PATH/$DOMAIN.pem"
     else
