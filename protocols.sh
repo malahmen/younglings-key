@@ -90,9 +90,20 @@ _sign_with_ca() {
 _emit_cert_and_pem() {
     execute openssl x509 -inform PEM -in "$CERTIFICATES_PATH/$DOMAIN.crt" \
         -out "$CERTIFICATES_PATH/$DOMAIN.cert"
-    execute cat "$CERTIFICATES_PATH/$DOMAIN.key" "$CERTIFICATES_PATH/$DOMAIN.crt" \
-        > "$CERTIFICATES_PATH/$DOMAIN.pem"
+    _write_pem "$CERTIFICATES_PATH/$DOMAIN.key" "$CERTIFICATES_PATH/$DOMAIN.crt" \
+        "$CERTIFICATES_PATH/$DOMAIN.pem"
     msg "Generated: $DOMAIN.crt, $DOMAIN.cert, $DOMAIN.pem in $CERTIFICATES_PATH/"
+}
+
+# Bundle key + crt into a .pem. It carries the private key, so it must be 0600:
+# umask covers creation, chmod covers a .pem left behind by an earlier run.
+_write_pem() {
+    local key="${1:?}" crt="${2:?}" out="${3:?}" old_umask
+    old_umask=$(umask)
+    umask 077
+    execute cat "$key" "$crt" > "$out"
+    umask "$old_umask"
+    execute chmod 600 "$out"
 }
 
 # ---- File conversions ---------------------------------------------------------
@@ -130,7 +141,7 @@ generate_files_from_crt_protocol() {
         [ -f "$key_path" ] || key_path="$CERTIFICATES_PATH/$PRIVATE_KEY"
         [ -f "$key_path" ] || execution_error "$ERR_KEY_FNF"
         grep -q "PRIVATE KEY" "$key_path" || execution_error "$ERR_KEY_NK"
-        execute cat "$key_path" "$crt_path" > "$CERTIFICATES_PATH/$DOMAIN.pem"
+        _write_pem "$key_path" "$crt_path" "$CERTIFICATES_PATH/$DOMAIN.pem"
         msg "Generated: $CERTIFICATES_PATH/$DOMAIN.pem"
     else
         wrn "$ERR_KEY_FNS — skipping .pem (pass -k <key> to include it)."
