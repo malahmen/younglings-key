@@ -41,7 +41,13 @@ if [ -n "$CRT_FILE" ]; then
     exit 0
 fi
 
+# -k only pairs with -r; say so rather than dropping it silently.
+if [ -n "$PRIVATE_KEY" ]; then
+    wrn "$ERR_KEY_NR"
+fi
+
 validate_domain "$DOMAIN"
+validate_numbits "$NUMBITS"                   # also lands in the template (-g 1)
 
 # ---- Mode 2: emit a .cfg template and exit ------------------------------------
 validate_template_flag "$TEMPLATE"
@@ -52,7 +58,6 @@ fi
 
 # ---- Mode 3: self-signed certificate or CSR -----------------------------------
 validate_self_signed "$SELF_SIGNED"
-validate_numbits "$NUMBITS"
 
 # Subject source: a config file (-f) OR a subject string (-i), not neither.
 if [ -n "$CONFIGURATION_FILE" ]; then
