@@ -30,6 +30,7 @@ self_signed_protocol_subject() {
     _build_ca
     execute openssl genrsa -out "$CERTIFICATES_PATH/$DOMAIN.key" "$NUMBITS"
     execute openssl req -sha512 -new -subj "$SUBJECT" \
+        -addext "subjectAltName=$(_san_for_domain)" \
         -key "$CERTIFICATES_PATH/$DOMAIN.key" \
         -out "$CERTIFICATES_PATH/$DOMAIN.csr"
     _sign_with_ca
@@ -50,6 +51,7 @@ certificate_request_protocol_subject() {
     execute mkdir -p "$CERTIFICATES_PATH"
     execute openssl genrsa -out "$CERTIFICATES_PATH/$DOMAIN.key" "$NUMBITS"
     execute openssl req -sha512 -new -subj "$SUBJECT" \
+        -addext "subjectAltName=$(_san_for_domain)" \
         -key "$CERTIFICATES_PATH/$DOMAIN.key" \
         -out "$CERTIFICATES_PATH/$DOMAIN.csr"
     execute openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr"
@@ -81,6 +83,12 @@ _build_ca() {
         -subj "$SUBJECT_CA" \
         -key "$CERTIFICATES_PATH/ca.key" \
         -out "$CERTIFICATES_PATH/ca.crt"
+}
+
+# SAN entry used when the CSR is built from a subject string (-i): an IPv4
+# address must be an IP: entry, anything else is DNS:.
+_san_for_domain() {
+    if is_ipv4 "$DOMAIN"; then printf 'IP:%s' "$DOMAIN"; else printf 'DNS:%s' "$DOMAIN"; fi
 }
 
 _sign_with_ca() {
@@ -157,7 +165,14 @@ generate_files_from_crt_protocol() {
 # Write a ready-to-edit openssl config template for $DOMAIN.
 generate_configuration_file_template_protocol() {
     execute mkdir -p "$CERTIFICATES_PATH"
-    local out="$CERTIFICATES_PATH/$DOMAIN.cfg"
+    local out="$CERTIFICATES_PATH/$DOMAIN.cfg" alt_names
+    if is_ipv4 "$DOMAIN"; then
+        alt_names="IP.1  = $DOMAIN"
+    elif [ "${DOMAIN#\*.}" != "$DOMAIN" ]; then          # *.example.com + its apex
+        alt_names="DNS.1 = $DOMAIN"$'\n'"DNS.2 = ${DOMAIN#\*.}"
+    else
+        alt_names="DNS.1 = $DOMAIN"$'\n'"DNS.2 = www.$DOMAIN"
+    fi
     cat > "$out" <<-EOF
 	[ req ]
 	default_bits        = $NUMBITS
@@ -181,9 +196,8 @@ generate_configuration_file_template_protocol() {
 	subjectAltName = @alt_names
 
 	[ alt_names ]
-	DNS.1 = $DOMAIN
-	DNS.2 = www.$DOMAIN
-	# Add more DNS.3, DNS.4, ... or IP.1, IP.2, ... as needed.
+	$alt_names
+	# Add more DNS.n / IP.n entries as needed.
 	EOF
     msg "Template written: $out"
 }
