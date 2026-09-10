@@ -69,7 +69,13 @@ certificate_request_protocol_configured() {
 
 # ---- Shared steps -------------------------------------------------------------
 
+# Create the CA once; later runs sign with it so already-trusted certs stay
+# valid. Delete ca.key and ca.crt to get a fresh CA.
 _build_ca() {
+    if [ -f "$CERTIFICATES_PATH/ca.key" ] && [ -f "$CERTIFICATES_PATH/ca.crt" ]; then
+        msg "Reusing existing CA: $CERTIFICATES_PATH/ca.crt (delete ca.key and ca.crt to regenerate)"
+        return 0
+    fi
     execute openssl genrsa -out "$CERTIFICATES_PATH/ca.key" "$NUMBITS"
     execute openssl req -x509 -new -nodes -sha512 -days "$DURATION" \
         -subj "$SUBJECT_CA" \
