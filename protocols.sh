@@ -91,12 +91,38 @@ _san_for_domain() {
     if is_ipv4 "$DOMAIN"; then printf 'IP:%s' "$DOMAIN"; else printf 'DNS:%s' "$DOMAIN"; fi
 }
 
+# True when `openssl x509 -req` supports -copy_extensions (OpenSSL >= 3.0;
+# LibreSSL and OpenSSL 1.x do not).
+_openssl_copies_extensions() {
+    local name major
+    read -r name major _ < <(openssl version)
+    [ "$name" = "OpenSSL" ] && [ "${major%%.*}" -ge 3 ]
+}
+
+# Write an -extfile carrying the CSR's SAN (or the entry derived from -d when it has none).
+_write_san_extfile() {
+    local out="${1:?}" san
+    san=$(openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr" \
+        | grep -A1 'Subject Alternative Name' | tail -n 1 | tr -d ' ' || true)
+    [ -n "$san" ] || san=$(_san_for_domain)
+    printf 'subjectAltName = %s\n' "$san" > "$out"
+}
+
+# Sign the CSR with the CA. By default `openssl x509 -req` drops the CSR's
+# extensions, so the SAN is carried over explicitly: -copy_extensions on
+# OpenSSL 3, an -extfile built from the CSR otherwise.
 _sign_with_ca() {
     execute openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr"
-    execute openssl x509 -req -sha512 -days "$DURATION" \
+    local ext_opts=(-copy_extensions copy)
+    if ! _openssl_copies_extensions; then
+        _write_san_extfile "$CERTIFICATES_PATH/$DOMAIN.ext"
+        ext_opts=(-extfile "$CERTIFICATES_PATH/$DOMAIN.ext")
+    fi
+    execute openssl x509 -req -sha512 -days "$DURATION" "${ext_opts[@]}" \
         -CA "$CERTIFICATES_PATH/ca.crt" -CAkey "$CERTIFICATES_PATH/ca.key" -CAcreateserial \
         -in "$CERTIFICATES_PATH/$DOMAIN.csr" \
         -out "$CERTIFICATES_PATH/$DOMAIN.crt"
+    rm -f "$CERTIFICATES_PATH/$DOMAIN.ext"
     execute openssl x509 -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.crt"
 }
 
@@ -180,7 +206,6 @@ generate_configuration_file_template_protocol() {
 	prompt              = no
 	distinguished_name  = req_distinguished_name
 	req_extensions      = req_ext
-	x509_extensions     = v3_ca
 
 	[ req_distinguished_name ]
 	C  = US
@@ -189,10 +214,8 @@ generate_configuration_file_template_protocol() {
 	O  = Organization
 	CN = $DOMAIN
 
+	# Extensions requested in the CSR; ignite.sh copies them into the signed .crt.
 	[ req_ext ]
-	subjectAltName = @alt_names
-
-	[ v3_ca ]
 	subjectAltName = @alt_names
 
 	[ alt_names ]
