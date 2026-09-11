@@ -5,7 +5,7 @@ display_usage() {
     cat << EOF 1>&2
   Usage: ignite.sh [options]
   Options:
-    -d DOMAIN              Domain to certify (e.g. example.com) — required
+    -d DOMAIN              Domain to certify: hostname, *.wildcard or IPv4 — required
     -s SELF_SIGNED        1 = self-signed certificate (default), 0 = CSR only
     -n NUMBITS            RSA key size: 2048 (default), 3072, or 4096
     -t DURATION           Certificate validity in days (self-signed; 1-3650)
@@ -61,11 +61,17 @@ read_parameters() {
     done
 }
 
-# Function: validate a domain name.
+# Function: is $1 a dotted-quad IPv4 address?
+is_ipv4() { printf '%s' "${1:-}" | grep -Eq "$re_ipv4"; }
+
+# Function: validate a domain: hostname (example.com, localhost, myhost),
+# wildcard (*.example.com) or IPv4 address.
 validate_domain() {
     local domain="${1:-}"
     [ -z "$domain" ] && parameter_missing_error "$ERR_DN_NS"
-    if ! printf '%s' "$domain" | grep -Eq '^([a-zA-Z0-9](-*[a-zA-Z0-9])*\.)+[a-zA-Z]{2,63}$'; then
+    if printf '%s' "$domain" | grep -Eq '^[0-9.]+$'; then
+        is_ipv4 "$domain" || execution_error "$ERR_DN_I"    # all-numeric: must be a real IPv4
+    elif ! printf '%s' "$domain" | grep -Eq "$re_hostname"; then
         execution_error "$ERR_DN_I"
     fi
 }

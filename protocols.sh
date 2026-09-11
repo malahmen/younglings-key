@@ -71,7 +71,13 @@ certificate_request_protocol_configured() {
 
 # ---- Shared steps -------------------------------------------------------------
 
+# Create the CA once; later runs sign with it so already-trusted certs stay
+# valid. Delete ca.key and ca.crt to get a fresh CA.
 _build_ca() {
+    if [ -f "$CERTIFICATES_PATH/ca.key" ] && [ -f "$CERTIFICATES_PATH/ca.crt" ]; then
+        msg "Reusing existing CA: $CERTIFICATES_PATH/ca.crt (delete ca.key and ca.crt to regenerate)"
+        return 0
+    fi
     execute openssl genrsa -out "$CERTIFICATES_PATH/ca.key" "$NUMBITS"
     execute openssl req -x509 -new -nodes -sha512 -days "$DURATION" \
         -subj "$SUBJECT_CA" \
@@ -79,8 +85,11 @@ _build_ca() {
         -out "$CERTIFICATES_PATH/ca.crt"
 }
 
-# SAN entry used when the CSR is built from a subject string (-i).
-_san_for_domain() { printf 'DNS:%s' "$DOMAIN"; }
+# SAN entry used when the CSR is built from a subject string (-i): an IPv4
+# address must be an IP: entry, anything else is DNS:.
+_san_for_domain() {
+    if is_ipv4 "$DOMAIN"; then printf 'IP:%s' "$DOMAIN"; else printf 'DNS:%s' "$DOMAIN"; fi
+}
 
 # True when `openssl x509 -req` supports -copy_extensions (OpenSSL >= 3.0;
 # LibreSSL and OpenSSL 1.x do not).
@@ -90,7 +99,7 @@ _openssl_copies_extensions() {
     [ "$name" = "OpenSSL" ] && [ "${major%%.*}" -ge 3 ]
 }
 
-# Write an -extfile carrying the CSR's SAN (or DNS:$DOMAIN when it has none).
+# Write an -extfile carrying the CSR's SAN (or the entry derived from -d when it has none).
 _write_san_extfile() {
     local out="${1:?}" san
     san=$(openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr" \
@@ -121,9 +130,20 @@ _sign_with_ca() {
 _emit_cert_and_pem() {
     execute openssl x509 -inform PEM -in "$CERTIFICATES_PATH/$DOMAIN.crt" \
         -out "$CERTIFICATES_PATH/$DOMAIN.cert"
-    execute cat "$CERTIFICATES_PATH/$DOMAIN.key" "$CERTIFICATES_PATH/$DOMAIN.crt" \
-        > "$CERTIFICATES_PATH/$DOMAIN.pem"
+    _write_pem "$CERTIFICATES_PATH/$DOMAIN.key" "$CERTIFICATES_PATH/$DOMAIN.crt" \
+        "$CERTIFICATES_PATH/$DOMAIN.pem"
     msg "Generated: $DOMAIN.crt, $DOMAIN.cert, $DOMAIN.pem in $CERTIFICATES_PATH/"
+}
+
+# Bundle key + crt into a .pem. It carries the private key, so it must be 0600:
+# umask covers creation, chmod covers a .pem left behind by an earlier run.
+_write_pem() {
+    local key="${1:?}" crt="${2:?}" out="${3:?}" old_umask
+    old_umask=$(umask)
+    umask 077
+    execute cat "$key" "$crt" > "$out"
+    umask "$old_umask"
+    execute chmod 600 "$out"
 }
 
 # ---- File conversions ---------------------------------------------------------
@@ -161,7 +181,7 @@ generate_files_from_crt_protocol() {
         [ -f "$key_path" ] || key_path="$CERTIFICATES_PATH/$PRIVATE_KEY"
         [ -f "$key_path" ] || execution_error "$ERR_KEY_FNF"
         grep -q "PRIVATE KEY" "$key_path" || execution_error "$ERR_KEY_NK"
-        execute cat "$key_path" "$crt_path" > "$CERTIFICATES_PATH/$DOMAIN.pem"
+        _write_pem "$key_path" "$crt_path" "$CERTIFICATES_PATH/$DOMAIN.pem"
         msg "Generated: $CERTIFICATES_PATH/$DOMAIN.pem"
     else
         wrn "$ERR_KEY_FNS — skipping .pem (pass -k <key> to include it)."
@@ -171,7 +191,14 @@ generate_files_from_crt_protocol() {
 # Write a ready-to-edit openssl config template for $DOMAIN.
 generate_configuration_file_template_protocol() {
     execute mkdir -p "$CERTIFICATES_PATH"
-    local out="$CERTIFICATES_PATH/$DOMAIN.cfg"
+    local out="$CERTIFICATES_PATH/$DOMAIN.cfg" alt_names
+    if is_ipv4 "$DOMAIN"; then
+        alt_names="IP.1  = $DOMAIN"
+    elif [ "${DOMAIN#\*.}" != "$DOMAIN" ]; then          # *.example.com + its apex
+        alt_names="DNS.1 = $DOMAIN"$'\n'"DNS.2 = ${DOMAIN#\*.}"
+    else
+        alt_names="DNS.1 = $DOMAIN"$'\n'"DNS.2 = www.$DOMAIN"
+    fi
     cat > "$out" <<-EOF
 	[ req ]
 	default_bits        = $NUMBITS
@@ -192,9 +219,8 @@ generate_configuration_file_template_protocol() {
 	subjectAltName = @alt_names
 
 	[ alt_names ]
-	DNS.1 = $DOMAIN
-	DNS.2 = www.$DOMAIN
-	# Add more DNS.3, DNS.4, ... or IP.1, IP.2, ... as needed.
+	$alt_names
+	# Add more DNS.n / IP.n entries as needed.
 	EOF
     msg "Template written: $out"
 }
