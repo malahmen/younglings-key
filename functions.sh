@@ -16,8 +16,9 @@ display_usage() {
     -k PRIVATE_KEY        .key file to pair with -r when building a .pem
     -r CRT_FILE           .crt file to convert into .cert (and .pem with -k)
     -o OUTPUT_DIR         Where to write output (default ./certificates)
-    -I INSTALL_FILE       Install this certificate into the system trust store (needs root)
+    -I INSTALL_FILE       Install this certificate (see -T; system store needs root)
     -N INSTALL_NAME       Filename to install it as (default: the file's own basename)
+    -T INSTALL_TARGET     Where -I installs: system, nss, or all (default all)
     -h                    Show this help and exit
 EOF
 }
@@ -45,7 +46,7 @@ parameter_missing_error() {
 # Function: read parameters from the command line.
 read_parameters() {
     local option
-    while getopts ":d:s:n:t:f:i:a:g:k:r:o:I:N:h" option; do
+    while getopts ":d:s:n:t:f:i:a:g:k:r:o:I:N:T:h" option; do
         case "$option" in
             d) DOMAIN="$OPTARG" ;;
             s) SELF_SIGNED="$OPTARG" ;;
@@ -60,6 +61,7 @@ read_parameters() {
             o) OUTPUT_DIR="$OPTARG" ;;
             I) INSTALL_FILE="$OPTARG" ;;
             N) INSTALL_NAME="$OPTARG" ;;
+            T) INSTALL_TARGET="$OPTARG" ;;
             h) display_usage; exit 0 ;;
             :) parameter_missing_error "Option -$OPTARG requires a value." ;;
             \?|*) parameter_missing_error "$ERR_UO: -$OPTARG" ;;
@@ -187,4 +189,54 @@ detect_trust_store() {
     fi
     command -v "$TRUST_UPDATE" >/dev/null 2>&1 \
         || execution_error "$ERR_INST_NU: $TRUST_UPDATE"
+}
+
+# Function: validate -T.
+validate_install_target() {
+    case "${1:-}" in
+        system|nss|all) return 0 ;;
+        *) parameter_missing_error "$ERR_INST_TGT: ${1:-}" ;;
+    esac
+}
+
+# Function: whose NSS databases to touch.
+#
+# Under sudo, $HOME is root's. The system store needs root and the NSS stores
+# belong to the person at the keyboard, so `sudo ignite -I ca.crt` would
+# otherwise install the anchor correctly and then populate root's browser
+# profiles — leaving the browsers exactly as untrusting as before, with nothing
+# to indicate why.
+nss_user() { printf '%s' "${SUDO_USER:-$(id -un)}"; }
+nss_home() {
+    local u; u="$(nss_user)"
+    getent passwd "$u" 2>/dev/null | cut -d: -f6
+}
+
+# Function: print every NSS database on this machine, one path per line.
+#
+# Chromium-family browsers and Firefox do not read the OpenSSL system store at
+# all; they read NSS. Flatpaks multiply that: each app declaring persistent=.pki
+# gets its own database under ~/.var/app/<id>/, so a system-wide entry reaches
+# none of them.
+discover_nss_stores() {
+    local home; home="$(nss_home)"
+    [ -n "$home" ] || return 0
+    {
+        # Native Chromium, Chrome, and anything else using the shared user db.
+        printf '%s\n' "$home/.pki/nssdb"
+        # Flatpak apps with persistent=.pki.
+        printf '%s\n' "$home"/.var/app/*/data/pki/nssdb
+        printf '%s\n' "$home"/.var/app/*/.pki/nssdb
+        # Snap-packaged browsers.
+        printf '%s\n' "$home"/snap/*/current/.pki/nssdb
+        # Firefox keeps its own database per PROFILE and ignores both the system
+        # store and ~/.pki/nssdb, which is why it still warns when every
+        # Chromium browser has stopped.
+        printf '%s\n' "$home"/.mozilla/firefox/*/
+        printf '%s\n' "$home"/.var/app/org.mozilla.firefox/.mozilla/firefox/*/
+    } 2>/dev/null | while read -r d; do
+        # A real database, not an unexpanded glob: cert9.db (sql) or cert8.db.
+        [ -f "${d%/}/cert9.db" ] || [ -f "${d%/}/cert8.db" ] || continue
+        printf '%s\n' "${d%/}"
+    done
 }

@@ -14,7 +14,7 @@ interactive prompts, so it drops straight into scripts and pipelines.
 - **Certificate requests (CSR)** — generates a key + CSR to send to a certificate authority.
 - **Config templates** — writes an `openssl` `.cfg` template for a domain that you can edit and reuse.
 - **Format conversion** — produces `.cert` (and `.pem`, given the key) from an existing `.crt`.
-- **Trust-store install** — puts an existing certificate (typically your CA) into this machine's trust store, so clients stop warning about it.
+- **Trust-store install** — puts an existing certificate (typically your CA) into this machine's trust stores: the system store *and* every NSS database, which is what browsers actually read.
 
 Output goes where **`-o`** says. With `-o` omitted it falls back to
 `./certificates/` in the current directory.
@@ -73,8 +73,50 @@ sudo ./ignite.sh -I ./certificates/ca.crt
 
 ```sh
 ./ignite.sh -I /path/to/ca.crt            # shows what it would do, then stops
-sudo ./ignite.sh -I /path/to/ca.crt       # installs and verifies
+sudo ./ignite.sh -I /path/to/ca.crt       # system store + every NSS database
+./ignite.sh -I /path/to/ca.crt -T nss     # browsers only, no root needed
+sudo ./ignite.sh -I /path/to/ca.crt -T system
 ```
+
+### Two separate trust systems
+
+Installing into the system store and expecting browsers to follow is the mistake
+this exists to prevent. They are unrelated stores:
+
+| | Reads | Needs root |
+| --- | --- | --- |
+| `curl`, `git`, `rclone`, most daemons | the OpenSSL/p11-kit **system store** | yes |
+| Chrome, Chromium, Brave, Opera, Vivaldi, **Firefox** | **NSS** databases | no |
+
+A correct system install leaves every browser still warning, with nothing to say
+why. `-T all` (the default) does both.
+
+NSS makes it worse than one database: **Firefox keeps one per profile**, and
+**every Flatpak browser has its own**, because `persistent=.pki` gives the app
+its own `~/.var/app/<id>/`. So a single system-wide entry reaches none of them.
+`-I` discovers and populates:
+
+- `~/.pki/nssdb` — native Chromium-family browsers
+- `~/.var/app/*/data/pki/nssdb` and `~/.var/app/*/.pki/nssdb` — Flatpak apps
+- `~/snap/*/current/.pki/nssdb` — Snap packages
+- `~/.mozilla/firefox/*/` and the Flatpak equivalent — Firefox profiles
+
+A directory is only used when it actually contains `cert9.db` or `cert8.db`, so
+an unmatched glob is never mistaken for a path.
+
+**Under `sudo` it drops to `$SUDO_USER` for the NSS half.** The system store
+needs root and the NSS databases belong to the person at the keyboard; without
+this, `sudo ignite.sh -I ca.crt` would install the anchor correctly and then
+populate *root's* browser profiles, leaving the browsers exactly as untrusting
+as before.
+
+**Restart browsers fully afterwards.** NSS is read at startup, and closing the
+window often leaves a background process holding the old state.
+
+`certutil` (from `nss-tools` / `libnss3-tools`) is required for the NSS half and
+is **not** installed for you. On an image-based system where layering means a
+reboot, `-I` prints a ready-made `podman` command that runs `certutil` from a
+container against each database instead.
 
 It **searches nowhere**. `-I` takes a path, and if the certificate is not on the
 machine then it cannot be installed — rather than some older copy in a default
@@ -129,6 +171,7 @@ what was intended.
 | `-o OUTPUT_DIR` | Directory to write output into (default `./certificates`) |
 | `-I INSTALL_FILE` | Install this certificate into the system trust store (needs root) |
 | `-N INSTALL_NAME` | Filename to install it as (default: the file's own basename) |
+| `-T INSTALL_TARGET` | Where `-I` installs: `system`, `nss`, or `all` (default) |
 | `-h` | Show help and exit | — |
 
 **Domains** (`-d`) may be a regular hostname (`example.com`, `sub.example.com`),
@@ -163,6 +206,25 @@ For a domain `example.com`, `./certificates/` will contain, depending on the mod
 `ca.srl` is the CA's serial-number counter, maintained by `openssl` across runs.
 `.pem` bundles contain the **private key** followed by the certificate, so they are
 written with `0600` permissions — keep them out of version control.
+
+## Testing
+
+```sh
+tests/run-all.sh        # every tests/test-*.sh; non-zero exit if any fails
+```
+
+Everything there runs as an ordinary user against temporary directories: what
+`-I` refuses, that `-o` is honoured, that the leaf is CA-signed and carries a
+SAN, that NSS discovery never returns an unexpanded glob, and that `nss_home`
+follows `$SUDO_USER`.
+
+The *successful* installs need root and a real store, so they are checked in
+containers of both families — `verification failed` before, `OK` after:
+
+```sh
+podman run --rm -v "$PWD:/e:ro" registry.fedoraproject.org/fedora:41 \
+  bash -c 'dnf -q -y install openssl ca-certificates nss-tools && bash /e/ignite.sh -I /e/ca.crt'
+```
 
 ## Project layout
 

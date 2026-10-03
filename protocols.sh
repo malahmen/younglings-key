@@ -235,8 +235,8 @@ generate_configuration_file_template_protocol() {
 # machine, the answer is that it cannot be installed — not that some older copy
 # in a default directory gets installed instead.
 # -----------------------------------------------------------------------------
-install_certificate_protocol() {
-    validate_install_file "$INSTALL_FILE"
+# Install into the OpenSSL/p11-kit system store. Needs root.
+_install_system_store() {
     detect_trust_store
 
     local name dest
@@ -279,4 +279,85 @@ install_certificate_protocol() {
     else
         execution_error "$ERR_INST_VERIFY: $dest"
     fi
+}
+
+# Install into every NSS database on this machine.
+#
+# Separate from the system store because they are genuinely separate trust
+# systems: Chromium-family browsers and Firefox read NSS and ignore the OpenSSL
+# store entirely, so a correct system install leaves every browser still
+# warning — with nothing to say why.
+#
+# Needs no root: these are the user's own databases. Run under sudo it drops to
+# $SUDO_USER, so one invocation can do both halves correctly.
+_install_nss_stores() {
+    local stores name owner
+    mapfile -t stores < <(discover_nss_stores)
+    if [ "${#stores[@]}" -eq 0 ]; then
+        wrn "No NSS databases found - nothing to do for browsers."
+        wrn "That is expected on a server; on a desktop, start the browser once"
+        wrn "so it creates its profile, then re-run."
+        return 0
+    fi
+
+    command -v certutil >/dev/null 2>&1 || {
+        oerr "$ERR_CERTUTIL"
+        wrn "Install it (nss-tools / libnss3-tools), or on an image-based system"
+        wrn "where layering means a reboot, run certutil from a container:"
+        printf '\n  podman run --rm -v <nssdb>:/d:Z -v %s:/c.crt:ro,Z \\\n' "$INSTALL_FILE" 1>&2
+        printf '    registry.fedoraproject.org/fedora bash -c \\\n' 1>&2
+        printf '    "dnf -q -y install nss-tools && certutil -d sql:/d -A -t %s -n NAME -i /c.crt"\n\n' \
+            "'$NSS_TRUST_FLAGS'" 1>&2
+        return 1
+    }
+
+    name="${INSTALL_NAME:-$(basename "$INSTALL_FILE")}"
+    name="${name%.*}"
+    owner="$(nss_user)"
+
+    local failed=0 s
+    for s in "${stores[@]}"; do
+        # -A is additive and replaces an entry of the same nickname, so this is
+        # safe to re-run.
+        if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+            sudo -u "$owner" certutil -d "sql:$s" -A \
+                -t "$NSS_TRUST_FLAGS" -n "$name" -i "$INSTALL_FILE" 2>/dev/null
+        else
+            certutil -d "sql:$s" -A \
+                -t "$NSS_TRUST_FLAGS" -n "$name" -i "$INSTALL_FILE" 2>/dev/null
+        fi
+        # Read it back rather than trusting the exit code: certutil returns 0
+        # for a database it could not actually write.
+        if certutil -d "sql:$s" -L 2>/dev/null | grep -qF "$name"; then
+            msg "NSS: added to $s"
+        else
+            wrn "NSS: FAILED for $s"
+            failed=$((failed + 1))
+        fi
+    done
+
+    [ "$failed" -eq 0 ] || return 1
+    wrn "Restart the browsers fully - NSS is read at startup, and closing the"
+    wrn "window often leaves a background process holding the old state."
+    return 0
+}
+
+# Dispatcher for -I, selected by -T.
+install_certificate_protocol() {
+    validate_install_file "$INSTALL_FILE"
+    validate_install_target "$INSTALL_TARGET"
+
+    local rc=0
+    case "$INSTALL_TARGET" in
+        system) _install_system_store ;;
+        nss)    _install_nss_stores || rc=1 ;;
+        all)
+            # System first: it needs root and may stop to ask for it, and there
+            # is no point populating browsers for a machine that will not trust
+            # the certificate itself.
+            _install_system_store
+            _install_nss_stores || rc=1
+            ;;
+    esac
+    return "$rc"
 }

@@ -10,3 +10,8 @@ TRUST_UPDATE_RHEL="update-ca-trust"
 TRUST_ANCHORS_DEBIAN="/usr/local/share/ca-certificates"
 TRUST_UPDATE_DEBIAN="update-ca-certificates"
 INSTALL_CERTIFICATE="install_certificate"
+
+# NSS trust flags. "C,," marks the certificate a trusted CA for TLS server
+# certificates — the form Chromium documents. The empty second and third fields
+# leave email and code-signing trust alone.
+NSS_TRUST_FLAGS="C,,"

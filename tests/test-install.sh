@@ -78,6 +78,72 @@ else
     printf '  SKIP  non-root assertions (running as root)\n'
 fi
 
+# --- -T validation -----------------------------------------------------------
+for bad in bogus "" system,nss; do
+    out="$(run -I "$OUT/ca.crt" -T "$bad")"
+    if printf '%s' "$out" | grep -q 'Invalid install target'; then
+        ok "-T rejects '${bad}'"
+    else
+        bad "-T accepted '${bad}'"
+    fi
+done
+for good in system nss all; do
+    out="$(run -I "$OUT/ca.crt" -T "$good")"
+    if printf '%s' "$out" | grep -q 'Invalid install target'; then
+        bad "-T rejected '${good}'"
+    else
+        ok "-T accepts '${good}'"
+    fi
+done
+
+# --- NSS discovery -----------------------------------------------------------
+# Only shape is asserted here: a database that exists must be found, and a glob
+# that matched nothing must never be returned as a path. Installing into one is
+# checked in a container (see README) because it needs certutil.
+# shellcheck source=/dev/null
+(
+    . "$(dirname "$ENGINE")/regex.sh";      . "$(dirname "$ENGINE")/colors.sh"
+    . "$(dirname "$ENGINE")/parameters.sh"; . "$(dirname "$ENGINE")/constants.sh"
+    . "$(dirname "$ENGINE")/variables.sh";  . "$(dirname "$ENGINE")/errors.sh"
+    . "$(dirname "$ENGINE")/functions.sh"
+    found=0
+    while read -r d; do
+        [ -n "$d" ] || continue
+        found=$((found + 1))
+        # An unexpanded glob would come back containing a '*'.
+        case "$d" in *'*'*) echo "GLOB_LEAKED:$d" ;; esac
+        [ -f "$d/cert9.db" ] || [ -f "$d/cert8.db" ] || echo "NOT_A_DB:$d"
+    done < <(discover_nss_stores)
+    echo "COUNT:$found"
+) > "$W/nss.out" 2>&1
+if grep -q 'GLOB_LEAKED' "$W/nss.out"; then
+    bad "discover_nss_stores returned an unexpanded glob"
+else
+    ok "discover_nss_stores never returns an unexpanded glob"
+fi
+if grep -q 'NOT_A_DB' "$W/nss.out"; then
+    bad "discover_nss_stores returned a directory with no cert db"
+else
+    ok "discover_nss_stores returns only real databases"
+fi
+
+# --- the sudo trap -----------------------------------------------------------
+# Under sudo, $HOME is root's. The system store needs root and the NSS stores
+# belong to the person at the keyboard, so nss_home must follow $SUDO_USER or
+# `sudo ignite -I` populates root's browser profiles and the browsers stay
+# exactly as untrusting as before.
+h="$(SUDO_USER="$(id -un)" bash -c '
+    . '"$(dirname "$ENGINE")"'/regex.sh; . '"$(dirname "$ENGINE")"'/colors.sh
+    . '"$(dirname "$ENGINE")"'/parameters.sh; . '"$(dirname "$ENGINE")"'/constants.sh
+    . '"$(dirname "$ENGINE")"'/variables.sh; . '"$(dirname "$ENGINE")"'/errors.sh
+    . '"$(dirname "$ENGINE")"'/functions.sh
+    HOME=/root nss_home')"
+if [ "$h" = "$(getent passwd "$(id -un)" | cut -d: -f6)" ]; then
+    ok "nss_home follows \$SUDO_USER, not root's HOME"
+else
+    bad "nss_home returned '${h}' - sudo would populate the wrong user's stores"
+fi
+
 echo
 if [ "$FAILED" -gt 0 ]; then echo "${FAILED} assertion(s) failed" >&2; exit 1; fi
 echo "all assertions passed"
