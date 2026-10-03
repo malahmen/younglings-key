@@ -224,3 +224,59 @@ generate_configuration_file_template_protocol() {
 	EOF
     msg "Template written: $out"
 }
+
+# -----------------------------------------------------------------------------
+# Install an existing certificate into this machine's trust store.
+#
+# For CLIENTS. Servers in a managed fleet should get their anchors from whatever
+# configures them (Ansible, cloud-init); doing it by hand there drifts.
+#
+# Takes an explicit path and searches nowhere. If the certificate is not on the
+# machine, the answer is that it cannot be installed — not that some older copy
+# in a default directory gets installed instead.
+# -----------------------------------------------------------------------------
+install_certificate_protocol() {
+    validate_install_file "$INSTALL_FILE"
+    detect_trust_store
+
+    local name dest
+    name="${INSTALL_NAME:-$(basename "$INSTALL_FILE")}"
+    # Debian's update-ca-certificates only reads files ending in .crt and says
+    # nothing about the ones it skips.
+    case "$name" in *.crt) ;; *) name="${name%.*}.crt" ;; esac
+    dest="$TRUST_ANCHORS/$name"
+
+    # Show the subject before touching anything: the whole point of a trust
+    # anchor is that it can vouch for any name, so the caller should see whose
+    # certificate they are about to trust.
+    msg "Installing into: $dest"
+    openssl x509 -noout -subject -issuer -dates -in "$INSTALL_FILE" 1>&2 || true
+    if ! openssl x509 -noout -ext basicConstraints -in "$INSTALL_FILE" 2>/dev/null \
+            | grep -q 'CA:TRUE'; then
+        wrn "This certificate is not a CA (no basicConstraints CA:TRUE). Installing"
+        wrn "it trusts exactly this certificate, not anything it signed."
+    fi
+
+    # Never elevates on its own. Trust anchors are the one thing where a tool
+    # silently acquiring root is least welcome, so when this is not root it
+    # prints the two commands and stops.
+    if [ "$(id -u)" -ne 0 ]; then
+        oerr "$ERR_INST_ROOT"
+        printf '\n  sudo install -m 0644 %s %s\n  sudo %s\n\n' \
+            "$INSTALL_FILE" "$dest" "$TRUST_UPDATE" 1>&2
+        exit 1
+    fi
+
+    execute install -m 0644 "$INSTALL_FILE" "$dest"
+    execute "$TRUST_UPDATE"
+
+    # Verify rather than assume. `openssl verify` with no -CAfile uses the
+    # system store, so a self-signed CA that is now trusted verifies against
+    # itself; before the install it does not. This is the check that the copy
+    # and the update actually took effect.
+    if openssl verify "$INSTALL_FILE" >/dev/null 2>&1; then
+        msg "Installed and trusted: $dest"
+    else
+        execution_error "$ERR_INST_VERIFY: $dest"
+    fi
+}

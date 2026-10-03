@@ -15,6 +15,9 @@ display_usage() {
     -g TEMPLATE           1 = write a .cfg template for DOMAIN and exit
     -k PRIVATE_KEY        .key file to pair with -r when building a .pem
     -r CRT_FILE           .crt file to convert into .cert (and .pem with -k)
+    -o OUTPUT_DIR         Where to write output (default ./certificates)
+    -I INSTALL_FILE       Install this certificate into the system trust store (needs root)
+    -N INSTALL_NAME       Filename to install it as (default: the file's own basename)
     -h                    Show this help and exit
 EOF
 }
@@ -42,7 +45,7 @@ parameter_missing_error() {
 # Function: read parameters from the command line.
 read_parameters() {
     local option
-    while getopts ":d:s:n:t:f:i:a:g:k:r:h" option; do
+    while getopts ":d:s:n:t:f:i:a:g:k:r:o:I:N:h" option; do
         case "$option" in
             d) DOMAIN="$OPTARG" ;;
             s) SELF_SIGNED="$OPTARG" ;;
@@ -54,6 +57,9 @@ read_parameters() {
             g) TEMPLATE="$OPTARG" ;;
             k) PRIVATE_KEY="$OPTARG" ;;
             r) CRT_FILE="$OPTARG" ;;
+            o) OUTPUT_DIR="$OPTARG" ;;
+            I) INSTALL_FILE="$OPTARG" ;;
+            N) INSTALL_NAME="$OPTARG" ;;
             h) display_usage; exit 0 ;;
             :) parameter_missing_error "Option -$OPTARG requires a value." ;;
             \?|*) parameter_missing_error "$ERR_UO: -$OPTARG" ;;
@@ -130,4 +136,55 @@ execute() {
     if ! "$@"; then
         execution_error "$ERR_FEC ('$*')"
     fi
+}
+
+# Function: recompute the output path from the parsed flags.
+#
+# variables.sh is sourced BEFORE read_parameters runs, so CERTIFICATES_PATH is
+# first computed while OUTPUT_DIR is still empty. Without this, -o parses
+# cleanly, changes nothing, and every file lands in ./certificates anyway —
+# which is worse than rejecting the flag, because the caller is told where the
+# key went and it is not there.
+resolve_paths() {
+    CERTIFICATES_PATH="${OUTPUT_DIR:-$CERTIFICATES_DIR}"
+}
+
+# Function: validate the certificate handed to -I.
+#
+# Checked for content, not extension: a .crt that is actually a CSR or a key is
+# the mistake worth catching, and installing a private key into a world-readable
+# anchors directory is the one that would hurt.
+validate_install_file() {
+    [ -n "${1:-}" ] || parameter_missing_error "$ERR_INST_FNF"
+    [ -f "$1" ] || execution_error "$ERR_INST_FNF: $1"
+    # Parsed by openssl, not matched as text. `grep 'BEGIN CERTIFICATE'` accepts
+    # a CSR, because "-----BEGIN CERTIFICATE REQUEST-----" contains that
+    # substring — so a CSR would have been installed as a trust anchor. openssl
+    # x509 succeeds only for an actual certificate.
+    openssl x509 -noout -in "$1" >/dev/null 2>&1 \
+        || execution_error "$ERR_INST_NC: $1"
+    # A certificate file should not carry a key. If it does, installing it would
+    # copy a private key into a world-readable anchors directory.
+    if grep -q 'PRIVATE KEY' "$1"; then
+        execution_error "Refusing to install a file containing a PRIVATE KEY: $1"
+    fi
+}
+
+# Function: pick the trust store this machine actually uses.
+#
+# Sets TRUST_ANCHORS and TRUST_UPDATE. Detection is by the presence of the
+# anchors directory AND its update command, so a half-installed ca-certificates
+# package fails with a clear reason instead of a copy that never takes effect.
+detect_trust_store() {
+    if [ -d "$TRUST_ANCHORS_RHEL" ]; then
+        TRUST_ANCHORS="$TRUST_ANCHORS_RHEL"
+        TRUST_UPDATE="$TRUST_UPDATE_RHEL"
+    elif [ -d "$TRUST_ANCHORS_DEBIAN" ]; then
+        TRUST_ANCHORS="$TRUST_ANCHORS_DEBIAN"
+        TRUST_UPDATE="$TRUST_UPDATE_DEBIAN"
+    else
+        execution_error "$ERR_INST_NS"
+    fi
+    command -v "$TRUST_UPDATE" >/dev/null 2>&1 \
+        || execution_error "$ERR_INST_NU: $TRUST_UPDATE"
 }

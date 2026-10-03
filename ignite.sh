@@ -4,7 +4,8 @@
 #
 # A gum-free, flag-driven CLI around openssl. Generates CSRs, self-signed
 # certificates (with their own CA), .cfg templates, and .cert/.pem files from an
-# existing .crt. Output is written under ./certificates in the current directory.
+# existing .crt, and installs an existing certificate into this machine's trust
+# store (-I). Output goes where -o says, or ./certificates when it is omitted.
 #
 # Only dependency: openssl. Run --help for options.
 # -----------------------------------------------------------------------------
@@ -30,8 +31,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Read parameters from the command line.
 read_parameters "$@"
 
+# Apply -o. Must happen after read_parameters: variables.sh computed
+# CERTIFICATES_PATH while OUTPUT_DIR was still empty.
+resolve_paths
+
 # openssl is the only hard dependency.
 command -v openssl >/dev/null 2>&1 || execution_error "$ERR_OPENSSL"
+
+# ---- Mode 0: install an existing certificate into the trust store -------------
+# Chosen by -I. Takes no domain and generates nothing, so it runs before every
+# other check: validating a domain the caller never supplied would reject a
+# perfectly good install.
+if [ -n "$INSTALL_FILE" ]; then
+    install_certificate_protocol
+    exit 0
+fi
 
 # ---- Mode 1: build .cert (+ .pem) from an existing .crt -----------------------
 # Chosen by providing -r <crt> (and optionally -k <key> for the .pem).

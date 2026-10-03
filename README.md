@@ -4,8 +4,9 @@
 
 A small, gum-free, **flag-driven** CLI around `openssl`. It generates certificate
 signing requests, self-signed certificates (with their own CA), ready-to-edit
-`openssl` config templates, and `.cert`/`.pem` files from an existing `.crt` — with
-no interactive prompts, so it drops straight into scripts and pipelines.
+`openssl` config templates, and `.cert`/`.pem` files from an existing `.crt`, and
+installs an existing certificate into the machine's trust store — with no
+interactive prompts, so it drops straight into scripts and pipelines.
 
 ## Capabilities
 
@@ -13,15 +14,20 @@ no interactive prompts, so it drops straight into scripts and pipelines.
 - **Certificate requests (CSR)** — generates a key + CSR to send to a certificate authority.
 - **Config templates** — writes an `openssl` `.cfg` template for a domain that you can edit and reuse.
 - **Format conversion** — produces `.cert` (and `.pem`, given the key) from an existing `.crt`.
+- **Trust-store install** — puts an existing certificate (typically your CA) into this machine's trust store, so clients stop warning about it.
 
-Output is written under **`./certificates/`** in the current directory.
+Output goes where **`-o`** says. With `-o` omitted it falls back to
+`./certificates/` in the current directory.
 
 ## Requirements
 
 - **`openssl`** — the only hard dependency (checked at start).
 - **`bash`** — the script uses `#!/usr/bin/env bash` with strict mode.
 
-No elevated privileges are needed; it writes only under the working directory.
+Generating needs no elevated privileges and writes only where you point it.
+**Installing a trust anchor does need root** — and `ignite.sh` never takes it
+for you: run as a normal user it prints the subject of the certificate, then the
+exact two commands to run, and exits non-zero.
 
 ## Install
 
@@ -55,6 +61,57 @@ chmod +x ignite.sh
 ./ignite.sh -d example.com -r example.com.crt -k example.com.key
 ```
 
+```sh
+# 6) Install a CA into this machine's trust store (needs root)
+sudo ./ignite.sh -I ./certificates/ca.crt
+
+# ...and everywhere, write output where you choose rather than ./certificates
+./ignite.sh -d example.com -o ~/certs -i '/C=PT/O=Acme/CN=example.com'
+```
+
+## Installing a certificate
+
+```sh
+./ignite.sh -I /path/to/ca.crt            # shows what it would do, then stops
+sudo ./ignite.sh -I /path/to/ca.crt       # installs and verifies
+```
+
+It **searches nowhere**. `-I` takes a path, and if the certificate is not on the
+machine then it cannot be installed — rather than some older copy in a default
+directory being installed in its place. Either you have the certificate with
+you, or you don't.
+
+The trust store is chosen by which anchors directory and update command actually
+exist, not by parsing `/etc/os-release`:
+
+| Family | Anchors | Refresh |
+| --- | --- | --- |
+| Fedora / RHEL (and derivatives such as Bazzite) | `/etc/pki/ca-trust/source/anchors` | `update-ca-trust` |
+| Debian / Ubuntu (and derivatives) | `/usr/local/share/ca-certificates` | `update-ca-certificates` |
+
+Detecting by presence means a derivative works without being listed, and a
+half-installed `ca-certificates` fails with a reason instead of a copy that
+never takes effect. On Debian the installed name is forced to end in `.crt`,
+because `update-ca-certificates` silently ignores anything else.
+
+**What it refuses**, all parsed with `openssl x509` rather than matched as text:
+
+- anything that is not a certificate. A CSR is the one that matters —
+  `-----BEGIN CERTIFICATE REQUEST-----` *contains* the substring
+  `BEGIN CERTIFICATE`, so a text match accepts it and a CSR gets installed as a
+  trust anchor.
+- a file containing a `PRIVATE KEY`, which would copy a key into a
+  world-readable anchors directory.
+
+**What it checks afterwards:** `openssl verify` against the system store with no
+`-CAfile`. A self-signed CA that is now trusted verifies against itself; before
+the install it does not. So the success message means the copy *and* the refresh
+actually took effect, rather than that two commands exited zero.
+
+It also warns when the certificate has no `basicConstraints CA:TRUE` — installing
+a leaf trusts exactly that certificate and nothing it signed, which is rarely
+what was intended.
+
 ## Options
 
 | Flag | Meaning | Default |
@@ -69,6 +126,9 @@ chmod +x ignite.sh
 | `-g TEMPLATE` | `1` = write a `.cfg` template for the domain and exit | `0` |
 | `-k PRIVATE_KEY` | `.key` file to pair with `-r` when building a `.pem` (without `-r` it is ignored with a warning) | — |
 | `-r CRT_FILE` | `.crt` file to convert into `.cert` (and `.pem` with `-k`) | — |
+| `-o OUTPUT_DIR` | Directory to write output into (default `./certificates`) |
+| `-I INSTALL_FILE` | Install this certificate into the system trust store (needs root) |
+| `-N INSTALL_NAME` | Filename to install it as (default: the file's own basename) |
 | `-h` | Show help and exit | — |
 
 **Domains** (`-d`) may be a regular hostname (`example.com`, `sub.example.com`),
