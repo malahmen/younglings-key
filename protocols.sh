@@ -281,6 +281,20 @@ _install_system_store() {
     fi
 }
 
+# certutil against one NSS database, as that database's owner.
+#
+# Factored out so the write and the read-back cannot disagree about who runs
+# them: the read-back used to run as root even when the write dropped to
+# $SUDO_USER, and certutil creates lock files beside the database.
+_nss_certutil() {
+    local owner="$1" store="$2"; shift 2
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+        sudo -u "$owner" certutil -d "sql:$store" "$@"
+    else
+        certutil -d "sql:$store" "$@"
+    fi
+}
+
 # Install into every NSS database on this machine.
 #
 # Separate from the system store because they are genuinely separate trust
@@ -319,16 +333,21 @@ _install_nss_stores() {
     for s in "${stores[@]}"; do
         # -A is additive and replaces an entry of the same nickname, so this is
         # safe to re-run.
-        if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
-            sudo -u "$owner" certutil -d "sql:$s" -A \
-                -t "$NSS_TRUST_FLAGS" -n "$name" -i "$INSTALL_FILE" 2>/dev/null
-        else
-            certutil -d "sql:$s" -A \
-                -t "$NSS_TRUST_FLAGS" -n "$name" -i "$INSTALL_FILE" 2>/dev/null
-        fi
+        _nss_certutil "$owner" "$s" -A \
+            -t "$NSS_TRUST_FLAGS" -n "$name" -i "$INSTALL_FILE" 2>/dev/null
         # Read it back rather than trusting the exit code: certutil returns 0
         # for a database it could not actually write.
-        if certutil -d "sql:$s" -L 2>/dev/null | grep -qF "$name"; then
+        #
+        # Asked for the nickname directly rather than grepping the listing.
+        # `certutil -L` opens with the header
+        #
+        #   Certificate Nickname                     Trust Attributes
+        #
+        # so `grep -F "$name"` matched "Certifi(ca)te" for the default name —
+        # 'ca', taken from ca.crt — and announced "NSS: added" for a database
+        # that had received nothing. The read-back existed precisely to catch
+        # that, and could not fail.
+        if _nss_certutil "$owner" "$s" -L -n "$name" >/dev/null 2>&1; then
             msg "NSS: added to $s"
         else
             wrn "NSS: FAILED for $s"
