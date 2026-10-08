@@ -17,7 +17,7 @@ display_usage() {
     -r CRT_FILE           .crt file to convert into .cert (and .pem with -k)
     -o OUTPUT_DIR         Where to write output (default ./certificates)
     -I INSTALL_FILE       Install this certificate (see -T; system store needs root)
-    -N INSTALL_NAME       Filename to install it as (default: the file's own basename)
+    -N INSTALL_NAME       Filename to install it as (default: younglings-<fingerprint>.crt)
     -T INSTALL_TARGET     Where -I installs: system, nss, or all (default all)
     -h                    Show this help and exit
 EOF
@@ -192,6 +192,16 @@ detect_trust_store() {
 }
 
 # Function: validate -T.
+# -N becomes a filename inside a root-owned trust directory, so it is
+# restricted rather than trusted: a '/' in it writes wherever it points, as
+# root, and a leading '.' hides the anchor from the person looking for it.
+validate_install_name() {
+    [ -n "${1:-}" ] || return 0   # empty = the default, see _anchor_base
+    case "$1" in
+        */*|.*) parameter_missing_error "$ERR_INST_NAME: ${1}" ;;
+    esac
+}
+
 validate_install_target() {
     case "${1:-}" in
         system|nss|all) return 0 ;;
