@@ -73,14 +73,34 @@ certificate_request_protocol_configured() {
 
 # Create the CA once; later runs sign with it so already-trusted certs stay
 # valid. Delete ca.key and ca.crt to get a fresh CA.
+# True when `openssl req` supports -addext (OpenSSL >= 1.1.1, LibreSSL >= 3.1).
+_openssl_has_addext() { openssl req -help 2>&1 | grep -q -- '-addext'; }
+
 _build_ca() {
     if [ -f "$CERTIFICATES_PATH/ca.key" ] && [ -f "$CERTIFICATES_PATH/ca.crt" ]; then
         msg "Reusing existing CA: $CERTIFICATES_PATH/ca.crt (delete ca.key and ca.crt to regenerate)"
         return 0
     fi
     execute openssl genrsa -out "$CERTIFICATES_PATH/ca.key" "$NUMBITS"
+
+    # The CA says what it is, explicitly, instead of relying on what each
+    # openssl adds by default — and they differ:
+    #   OpenSSL 3      basicConstraints critical CA:TRUE, but NO keyUsage
+    #   LibreSSL       neither: a v1 certificate with no extensions at all,
+    #                  which -I then wrongly reports as "not a CA", and which
+    #                  Chrome, macOS and NSS may refuse outright
+    # pathlen:0 because this CA signs leaves, never another CA.
+    local ca_ext=()
+    if _openssl_has_addext; then
+        ca_ext=(-addext "basicConstraints = critical, CA:TRUE, pathlen:0"
+                -addext "keyUsage = critical, keyCertSign, cRLSign")
+    else
+        wrn "This openssl has no -addext: the CA will carry whatever extensions"
+        wrn "it adds by default, which on LibreSSL is none. Browsers may refuse it."
+    fi
     execute openssl req -x509 -new -nodes -sha512 -days "$DURATION" \
         -subj "$SUBJECT_CA" \
+        "${ca_ext[@]+${ca_ext[@]}}" \
         -key "$CERTIFICATES_PATH/ca.key" \
         -out "$CERTIFICATES_PATH/ca.crt"
 }
@@ -235,15 +255,37 @@ generate_configuration_file_template_protocol() {
 # machine, the answer is that it cannot be installed — not that some older copy
 # in a default directory gets installed instead.
 # -----------------------------------------------------------------------------
+# _anchor_base — the name to install the certificate AS, without an extension.
+#
+# -N when given. Otherwise the certificate's own SHA-256 fingerprint, NOT its
+# basename: every CA this tool makes is called ca.crt and carries the same
+# subject, so the basename silently overwrote any other tool's ca.crt in the
+# anchors directory (and, in NSS, replaced whatever already held the nickname
+# "ca" — certutil -A replaces by nickname).
+#
+# Consequence worth knowing: an anchor installed by an older version as
+# ca.crt is NOT replaced by this name, it is joined by it. Pass -N ca.crt to
+# overwrite that one deliberately.
+_anchor_base() {
+    if [ -n "${INSTALL_NAME:-}" ]; then
+        printf '%s' "${INSTALL_NAME%.*}"
+        return 0
+    fi
+    local fp
+    fp="$(openssl x509 -noout -fingerprint -sha256 -in "$INSTALL_FILE" 2>/dev/null \
+          | sed 's/.*=//' | tr -d ':' | tr 'A-Z' 'a-z' | cut -c1-8)"
+    [ -n "$fp" ] || fp="unknown"
+    printf 'younglings-%s' "$fp"
+}
+
 # Install into the OpenSSL/p11-kit system store. Needs root.
 _install_system_store() {
     detect_trust_store
 
     local name dest
-    name="${INSTALL_NAME:-$(basename "$INSTALL_FILE")}"
     # Debian's update-ca-certificates only reads files ending in .crt and says
     # nothing about the ones it skips.
-    case "$name" in *.crt) ;; *) name="${name%.*}.crt" ;; esac
+    name="$(_anchor_base).crt"
     dest="$TRUST_ANCHORS/$name"
 
     # Show the subject before touching anything: the whole point of a trust
@@ -255,6 +297,18 @@ _install_system_store() {
             | grep -q 'CA:TRUE'; then
         wrn "This certificate is not a CA (no basicConstraints CA:TRUE). Installing"
         wrn "it trusts exactly this certificate, not anything it signed."
+    fi
+    # A trust anchor has to be self-signed to be usable as one: an anchor is
+    # where verification STOPS, and a certificate signed by someone else
+    # cannot be that. Installing a leaf from a chain adds an anchor nothing
+    # verifies against and leaves the caller believing the machine now trusts
+    # it. Refused rather than warned about, unlike the non-CA case above,
+    # which has a real use (pinning one self-signed server certificate).
+    if ! openssl verify -CAfile "$INSTALL_FILE" "$INSTALL_FILE" >/dev/null 2>&1; then
+        oerr "Refusing to install a certificate that is not self-signed: $INSTALL_FILE"
+        wrn "A trust anchor is where verification stops, so it must verify against"
+        wrn "itself. Install the CA that signed this certificate instead."
+        exit 1
     fi
 
     # Never elevates on its own. Trust anchors are the one thing where a tool
@@ -277,7 +331,15 @@ _install_system_store() {
     if openssl verify "$INSTALL_FILE" >/dev/null 2>&1; then
         msg "Installed and trusted: $dest"
     else
-        execution_error "$ERR_INST_VERIFY: $dest"
+        # Undone, not left behind. The copy is already in the anchors
+        # directory and the trust update has already run, so a bare error
+        # here left the machine in the state the caller was told had failed —
+        # a file in a root-owned trust directory that nothing reports and
+        # that the next run names differently.
+        wrn "Verification failed — removing $dest and re-running $TRUST_UPDATE"
+        rm -f "$dest"
+        "$TRUST_UPDATE" >/dev/null 2>&1 || wrn "$TRUST_UPDATE failed during rollback; run it by hand"
+        execution_error "$ERR_INST_VERIFY: $dest (rolled back)"
     fi
 }
 
@@ -325,8 +387,7 @@ _install_nss_stores() {
         return 1
     }
 
-    name="${INSTALL_NAME:-$(basename "$INSTALL_FILE")}"
-    name="${name%.*}"
+    name="$(_anchor_base)"
     owner="$(nss_user)"
 
     local failed=0 s
@@ -365,6 +426,7 @@ _install_nss_stores() {
 install_certificate_protocol() {
     validate_install_file "$INSTALL_FILE"
     validate_install_target "$INSTALL_TARGET"
+    validate_install_name "${INSTALL_NAME:-}"
 
     local rc=0
     case "$INSTALL_TARGET" in

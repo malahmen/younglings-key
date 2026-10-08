@@ -16,6 +16,29 @@ ENGINE="${IGNITE:-$(cd "$(dirname "$0")/.." && pwd)/ignite.sh}"
 
 W="$(mktemp -d)"
 trap 'rm -rf "$W"' EXIT
+
+# NOTHING HERE MAY TOUCH A REAL TRUST STORE.
+#
+# It used to. The -T acceptance loop below ran `-I ca.crt -T nss` (and -T all)
+# as the ordinary user to see whether the flag parsed — and that performs the
+# whole install, so every run added a throwaway CA to every NSS database on
+# the machine and then deleted its key. On this developer's laptop that is
+# five databases: ~/.pki/nssdb plus four Flatpak browsers.
+#
+# Two defences. First, the flag checks call the validators directly instead of
+# running an install (see below). Second, this: shadowing certutil and the
+# trust-update commands with hard failures, so a future edit that reintroduces
+# a real install fails the suite instead of modifying the machine.
+export PATH="$W/no-touch:$PATH"
+mkdir -p "$W/no-touch"
+for forbidden in certutil update-ca-trust update-ca-certificates trust; do
+    cat > "$W/no-touch/$forbidden" <<'GUARD'
+#!/bin/sh
+echo "TEST GUARD: $(basename "$0") must not be called by this suite - it writes to a real trust store" >&2
+exit 97
+GUARD
+    chmod +x "$W/no-touch/$forbidden"
+done
 OUT="$W/certs"
 FAILED=0
 
@@ -79,6 +102,8 @@ else
 fi
 
 # --- -T validation -----------------------------------------------------------
+# Rejection can still go through the engine: it exits at validation, before
+# anything is installed.
 for bad in bogus "" system,nss; do
     out="$(run -I "$OUT/ca.crt" -T "$bad")"
     if printf '%s' "$out" | grep -q 'Invalid install target'; then
@@ -87,14 +112,39 @@ for bad in bogus "" system,nss; do
         bad "-T accepted '${bad}'"
     fi
 done
+# ACCEPTANCE calls the validator directly. Running the engine to prove that
+# 'nss' parses meant performing the install to find out, which is what put a
+# CA into every browser database on the machine.
+# shellcheck source=/dev/null
+(
+    . "$(dirname "$ENGINE")/regex.sh";      . "$(dirname "$ENGINE")/colors.sh"
+    . "$(dirname "$ENGINE")/parameters.sh"; . "$(dirname "$ENGINE")/constants.sh"
+    . "$(dirname "$ENGINE")/variables.sh";  . "$(dirname "$ENGINE")/errors.sh"
+    . "$(dirname "$ENGINE")/functions.sh"
+    for good in system nss all; do
+        if validate_install_target "$good" 2>/dev/null; then echo "ACCEPT:$good"; fi
+    done
+    # -N lands in a root-owned directory, so it must not carry a path.
+    for n in 'ok.crt' 'plain'; do
+        if validate_install_name "$n" 2>/dev/null; then echo "NAME_OK:$n"; fi
+    done
+    for n in '../../etc/ssl/certs/evil.crt' '/etc/pki/evil.crt' 'a/b.crt' '.hidden'; do
+        if validate_install_name "$n" 2>/dev/null; then echo "NAME_ACCEPTED:$n"; fi
+    done
+) > "$W/validators.out" 2>&1
 for good in system nss all; do
-    out="$(run -I "$OUT/ca.crt" -T "$good")"
-    if printf '%s' "$out" | grep -q 'Invalid install target'; then
-        bad "-T rejected '${good}'"
-    else
-        ok "-T accepts '${good}'"
-    fi
+    if grep -qx "ACCEPT:$good" "$W/validators.out"; then ok "-T accepts '${good}'"
+    else bad "-T rejected '${good}'"; fi
 done
+for n in 'ok.crt' 'plain'; do
+    if grep -qx "NAME_OK:$n" "$W/validators.out"; then ok "-N accepts '${n}'"
+    else bad "-N rejected the plain name '${n}'"; fi
+done
+if grep -q 'NAME_ACCEPTED' "$W/validators.out"; then
+    bad "-N accepted a path: $(grep NAME_ACCEPTED "$W/validators.out" | tr '\n' ' ')"
+else
+    ok "-N rejects paths, traversal and dotfiles"
+fi
 
 # --- NSS discovery -----------------------------------------------------------
 # Only shape is asserted here: a database that exists must be found, and a glob
