@@ -119,6 +119,36 @@ _openssl_copies_extensions() {
     [ "$name" = "OpenSSL" ] && [ "${major%%.*}" -ge 3 ]
 }
 
+# _write_leaf_extfile <out> <csr> — the extensions a leaf should carry.
+#
+# Y3: leaves were issued with no basicConstraints, no keyUsage and no EKU at
+# all. Nothing in this homelab rejects that — `openssl verify -purpose
+# sslserver` and `-purpose sslclient` both pass on the real meksha.lan leaf
+# without them — so this is hygiene rather than a repair: a certificate that
+# says what it is for cannot be pressed into another role by something less
+# forgiving than OpenSSL, and absent-means-anything is a poor default to ship.
+#
+# serverAuth AND clientAuth, not serverAuth alone: the LAN services this
+# issues for include databases that may want the same certificate for client
+# authentication, and an EKU that excludes a use the operator then needs is a
+# worse failure than one that is slightly broad.
+#
+# Only extensions the CSR does NOT already declare are written. Measured: an
+# -extfile silently WINS over a CSR's own extension, so a config file asking
+# for extendedKeyUsage = codeSigning would otherwise have been quietly
+# re-issued as serverAuth.
+_write_leaf_extfile() {
+    local out="${1:?}" csr="${2:?}" txt
+    txt="$(openssl req -text -noout -in "$csr" 2>/dev/null || true)"
+    : > "$out"
+    printf '%s' "$txt" | grep -q 'X509v3 Basic Constraints' \
+        || echo 'basicConstraints = critical, CA:FALSE' >> "$out"
+    printf '%s' "$txt" | grep -q 'X509v3 Key Usage' \
+        || echo 'keyUsage = critical, digitalSignature, keyEncipherment' >> "$out"
+    printf '%s' "$txt" | grep -q 'X509v3 Extended Key Usage' \
+        || echo 'extendedKeyUsage = serverAuth, clientAuth' >> "$out"
+}
+
 # Write an -extfile carrying the CSR's SAN (or the entry derived from -d when it has none).
 _write_san_extfile() {
     local out="${1:?}" san
@@ -133,10 +163,26 @@ _write_san_extfile() {
 # OpenSSL 3, an -extfile built from the CSR otherwise.
 _sign_with_ca() {
     execute openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr"
-    local ext_opts=(-copy_extensions copy)
-    if ! _openssl_copies_extensions; then
-        _write_san_extfile "$CERTIFICATES_PATH/$DOMAIN.ext"
-        ext_opts=(-extfile "$CERTIFICATES_PATH/$DOMAIN.ext")
+    local extf="$CERTIFICATES_PATH/$DOMAIN.ext"
+    local ext_opts=()
+    if _openssl_copies_extensions; then
+        # -copy_extensions carries the CSR's own extensions (the SAN, and
+        # anything a -f config file added); the extfile fills in the leaf
+        # extensions it did not declare. Verified that the two compose: the
+        # CSR's SAN survives alongside the extfile's additions.
+        _write_leaf_extfile "$extf" "$CERTIFICATES_PATH/$DOMAIN.csr"
+        ext_opts=(-copy_extensions copy)
+        # An empty extfile is not worth passing, and openssl need not accept one.
+        [ -s "$extf" ] && ext_opts+=(-extfile "$extf")
+    else
+        # No -copy_extensions here, so the extfile has to carry the SAN too.
+        # This path has always dropped any OTHER extension the CSR declared;
+        # that is unchanged.
+        _write_san_extfile "$extf"
+        _write_leaf_extfile "${extf}.leaf" "$CERTIFICATES_PATH/$DOMAIN.csr"
+        cat "${extf}.leaf" >> "$extf"
+        rm -f "${extf}.leaf"
+        ext_opts=(-extfile "$extf")
     fi
     execute openssl x509 -req -sha512 -days "$DURATION" "${ext_opts[@]}" \
         -CA "$CERTIFICATES_PATH/ca.crt" -CAkey "$CERTIFICATES_PATH/ca.key" -CAcreateserial \
@@ -420,6 +466,135 @@ _install_nss_stores() {
     wrn "Restart the browsers fully - NSS is read at startup, and closing the"
     wrn "window often leaves a background process holding the old state."
     return 0
+}
+
+# ---- Uninstall (YK-6) --------------------------------------------------------
+#
+# The complement of -I, and necessary once -I stopped using the certificate's
+# basename (YK-5): an anchor an older version installed as ca.crt is now
+# JOINED by younglings-<fingerprint>.crt rather than replaced, so without this
+# there was no way to stop trusting either one through the tool. On this
+# machine /etc/pki/ca-trust/source/anchors/ holds exactly such a ca.crt.
+
+# _legacy_anchor — the pre-YK-5 path for this certificate, but only when the
+# file there IS this certificate.
+#
+# Identity by CONTENT, not by name: 'ca.crt' is a name anything could have
+# written, and removing another tool's trust anchor because it happens to
+# share a filename would be worse than leaving ours behind.
+_legacy_anchor() {
+    local base cur
+    base="$(basename "$INSTALL_FILE")"
+    case "$base" in *.crt) ;; *) base="${base%.*}.crt" ;; esac
+    cur="$(_anchor_base).crt"
+    [ "$base" != "$cur" ] || return 1
+    [ -f "$TRUST_ANCHORS/$base" ] || return 1
+    cmp -s "$INSTALL_FILE" "$TRUST_ANCHORS/$base" || return 1
+    printf '%s' "$TRUST_ANCHORS/$base"
+}
+
+_uninstall_system_store() {
+    detect_trust_store
+
+    local dest legacy="" removed=0
+    dest="$TRUST_ANCHORS/$(_anchor_base).crt"
+    legacy="$(_legacy_anchor || true)"
+
+    if [ ! -f "$dest" ] && [ -z "$legacy" ]; then
+        wrn "Not installed in the system store: $dest"
+        return 0
+    fi
+
+    msg "Removing from the system trust store:"
+    [ -f "$dest" ] && msg "  $dest"
+    [ -n "$legacy" ] && msg "  $legacy  (an older version's name; same certificate)"
+
+    # Never elevates on its own — same rule as the install.
+    if [ "$(id -u)" -ne 0 ]; then
+        oerr "$ERR_UNINST_ROOT"
+        [ -f "$dest" ] && printf '\n  sudo rm -f %s\n' "$dest" 1>&2
+        [ -n "$legacy" ] && printf '  sudo rm -f %s\n' "$legacy" 1>&2
+        printf '  sudo %s\n\n' "$TRUST_UPDATE" 1>&2
+        exit 1
+    fi
+
+    [ -f "$dest" ] && { execute rm -f "$dest"; removed=$((removed + 1)); }
+    [ -n "$legacy" ] && { execute rm -f "$legacy"; removed=$((removed + 1)); }
+    execute "$TRUST_UPDATE"
+
+    # Verified, not assumed — the mirror of the install's check. -I refuses
+    # anything that is not self-signed (YK-4), so everything this can be asked
+    # to remove verifies against the system store while it is trusted, and
+    # must stop doing so once it is gone.
+    if openssl verify "$INSTALL_FILE" >/dev/null 2>&1; then
+        wrn "Removed ${removed} file(s) and ran $TRUST_UPDATE, but the certificate is STILL trusted."
+        wrn "Another copy is installed under a name this cannot recognise, or another"
+        wrn "anchor on this machine signs it. Look in $TRUST_ANCHORS."
+        return 1
+    fi
+    msg "Removed ${removed} file(s); no longer trusted."
+}
+
+_uninstall_nss_stores() {
+    local stores name owner failed=0 s
+    mapfile -t stores < <(discover_nss_stores)
+    if [ "${#stores[@]}" -eq 0 ]; then
+        wrn "No NSS databases found - nothing to do for browsers."
+        return 0
+    fi
+    command -v certutil >/dev/null 2>&1 || { oerr "$ERR_CERTUTIL"; return 1; }
+
+    name="$(_anchor_base)"
+    owner="$(nss_user)"
+    for s in "${stores[@]}"; do
+        if ! _nss_certutil "$owner" "$s" -L -n "$name" >/dev/null 2>&1; then
+            msg "NSS: $name not present in $s"
+            continue
+        fi
+        # -D deletes by nickname.
+        _nss_certutil "$owner" "$s" -D -n "$name" 2>/dev/null
+        # Read back rather than trust the exit code — the same reason the
+        # install reads back (certutil returns 0 for a database it could not
+        # write), and the same question asked the same way.
+        if _nss_certutil "$owner" "$s" -L -n "$name" >/dev/null 2>&1; then
+            wrn "NSS: FAILED to remove $name from $s"
+            failed=$((failed + 1))
+        else
+            msg "NSS: removed $name from $s"
+        fi
+    done
+
+    [ "$failed" -eq 0 ] || return 1
+    wrn "Restart the browsers fully - NSS is read at startup, and closing the"
+    wrn "window often leaves a background process holding the old state."
+    return 0
+}
+
+# Dispatcher for -U, selected by -T. Mirrors install_certificate_protocol.
+uninstall_certificate_protocol() {
+    validate_install_file "$INSTALL_FILE"
+    validate_install_target "$INSTALL_TARGET"
+    validate_install_name "${INSTALL_NAME:-}"
+
+    # Shown before anything is removed, for the same reason the install shows
+    # it: the operator should see whose trust they are about to withdraw.
+    msg "Certificate:"
+    openssl x509 -noout -subject -issuer -dates -in "$INSTALL_FILE" 1>&2 || true
+
+    local rc=0
+    case "$INSTALL_TARGET" in
+        system) _uninstall_system_store || rc=1 ;;
+        nss)    _uninstall_nss_stores   || rc=1 ;;
+        all)
+            # NSS first here, the reverse of the install: the system store is
+            # the one that needs root and may stop to ask for it, and a
+            # browser left trusting a certificate the system no longer does
+            # is the more surprising half to leave behind.
+            _uninstall_nss_stores   || rc=1
+            _uninstall_system_store || rc=1
+            ;;
+    esac
+    return $rc
 }
 
 # Dispatcher for -I, selected by -T.

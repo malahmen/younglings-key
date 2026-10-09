@@ -78,6 +78,29 @@ sudo ./ignite.sh -I /path/to/ca.crt       # system store + every NSS database
 sudo ./ignite.sh -I /path/to/ca.crt -T system
 ```
 
+### Removing it again
+
+`-U` takes the same arguments as `-I` and removes exactly what `-I` with those
+arguments would have installed:
+
+```sh
+sudo ./ignite.sh -U -I /path/to/ca.crt            # system store + every NSS database
+./ignite.sh -U -I /path/to/ca.crt -T nss          # browsers only, no root needed
+sudo ./ignite.sh -U -I /path/to/ca.crt -T system
+```
+
+It also removes the file an **older version** installed under the
+certificate's own basename (`ca.crt`), because the default install name is now
+derived from the fingerprint and a re-install would otherwise leave that older
+copy trusted forever. That file is only removed when it is byte-identical to
+the certificate given: `ca.crt` is a name anything could have written, and
+removing another tool's anchor because it shares a filename would be worse
+than leaving this one behind.
+
+Like the install, it verifies rather than assumes — afterwards the certificate
+must no longer verify against the system store. If it still does, a copy is
+installed under some other name and that is reported instead of being hidden.
+
 ### Two separate trust systems
 
 Installing into the system store and expecting browsers to follow is the mistake
@@ -170,8 +193,9 @@ what was intended.
 | `-r CRT_FILE` | `.crt` file to convert into `.cert` (and `.pem` with `-k`) | — |
 | `-o OUTPUT_DIR` | Directory to write output into (default `./certificates`) |
 | `-I INSTALL_FILE` | Install this certificate into the system trust store (needs root) |
-| `-N INSTALL_NAME` | Filename to install it as (default: the file's own basename) |
-| `-T INSTALL_TARGET` | Where `-I` installs: `system`, `nss`, or `all` (default) |
+| `-N INSTALL_NAME` | Filename to install it as (default: `younglings-<fingerprint8>.crt`). No `/` and no leading `.` |
+| `-T INSTALL_TARGET` | Where `-I`/`-U` acts: `system`, `nss`, or `all` (default) |
+| `-U` | With `-I`: **remove** that certificate from the store instead of installing it |
 | `-h` | Show help and exit | — |
 
 **Domains** (`-d`) may be a regular hostname (`example.com`, `sub.example.com`),

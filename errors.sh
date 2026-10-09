@@ -32,5 +32,6 @@ ERR_INST_ROOT="Installing into the system trust store needs root - re-run with s
 ERR_INST_VERIFY="Installed the certificate, but openssl still does not trust it"
 ERR_OUT_NW="Output directory is not writable"
 ERR_INST_TGT="Invalid install target (use system, nss or all)"
+ERR_UNINST_ROOT="Removing from the system trust store needs root - re-run with sudo"
 ERR_INST_NAME="Invalid -N name: it must be a plain filename, with no '/' and no leading '.'"
 ERR_CERTUTIL="certutil not found - it comes from nss-tools"

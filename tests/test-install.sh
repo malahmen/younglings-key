@@ -101,6 +101,48 @@ else
     printf '  SKIP  non-root assertions (running as root)\n'
 fi
 
+# --- the leaf states what it is (Y3) -----------------------------------------
+# Leaves used to carry no basicConstraints, no keyUsage and no EKU at all.
+leaf_ext="$(openssl x509 -in "$OUT/test.lan.crt" -noout -text)"
+for want in 'CA:FALSE' 'Key Usage' 'TLS Web Server Authentication'; do
+    if printf '%s' "$leaf_ext" | grep -q "$want"; then ok "the leaf carries ${want}"
+    else bad "the leaf is missing ${want}"; fi
+done
+if openssl verify -CAfile "$OUT/ca.crt" -purpose sslserver "$OUT/test.lan.crt" >/dev/null 2>&1
+then ok "the leaf still verifies for sslserver"
+else bad "the leaf no longer verifies for sslserver"; fi
+# A CSR that declares its own EKU must keep it: an -extfile silently wins over
+# the CSR, so the defaults are only filled in where the CSR said nothing.
+cfg="$W/eku.cfg"
+cat > "$cfg" <<'CFG'
+[ req ]
+prompt = no
+distinguished_name = dn
+req_extensions = ext
+[ dn ]
+CN = code.lan
+[ ext ]
+subjectAltName = DNS:code.lan
+extendedKeyUsage = codeSigning
+CFG
+run -d 'code.lan' -o "$W/eku" -f "$cfg" >/dev/null 2>&1
+if openssl x509 -in "$W/eku/code.lan.crt" -noout -ext extendedKeyUsage 2>/dev/null | grep -q 'Code Signing'
+then ok "a CSR's own EKU is not overridden"
+else bad "a CSR's own EKU was overridden"; fi
+
+# --- -U is validated like -I (YK-6) ------------------------------------------
+# The removal itself needs root and a real store, so only the refusals are
+# asserted here; the rest is covered by the engine's own harness.
+out="$(run -U -I "$OUT/ca.crt" -T bogus)"
+if printf '%s' "$out" | grep -q 'Invalid install target'; then ok "-U validates -T"
+else bad "-U accepted -T bogus"; fi
+out="$(run -U -I "$OUT/ca.crt" -N ../escape.crt -T system)"
+if printf '%s' "$out" | grep -q 'Invalid -N name'; then ok "-U validates -N"
+else bad "-U accepted a path in -N"; fi
+out="$(run -U -I "$OUT/ca.crt" -T system)"
+if printf '%s' "$out" | grep -qE 'Not installed in the system store|needs root'; then ok "-U -T system reaches the uninstall"
+else bad "-U -T system did not reach the uninstall: ${out}"; fi
+
 # --- -T validation -----------------------------------------------------------
 # Rejection can still go through the engine: it exits at validation, before
 # anything is installed.
