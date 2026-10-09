@@ -363,4 +363,4 @@ interactive prompts), so it stays scriptable.
 
 ## License
 
-Released under the [Unlicense](LICENSE).
+[MIT](LICENSE) © 2026 malahmen.
