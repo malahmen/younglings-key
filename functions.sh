@@ -19,6 +19,9 @@ display_usage() {
     -I INSTALL_FILE       Install this certificate (see -T; system store needs root)
     -N INSTALL_NAME       Filename to install it as (default: younglings-<fingerprint>.crt)
     -U                    With -I: REMOVE that certificate from the store instead
+    -C NAME_CONSTRAINTS   Limit a NEW CA to these names, comma-separated
+                          (e.g. '.lan,.nip.io,192.168.0.0/16'); existing CAs are
+                          reused untouched, so this never affects one already in use
     -T INSTALL_TARGET     Where -I installs: system, nss, or all (default all)
     -h                    Show this help and exit
 EOF
@@ -47,7 +50,7 @@ parameter_missing_error() {
 # Function: read parameters from the command line.
 read_parameters() {
     local option
-    while getopts ":d:s:n:t:f:i:a:g:k:r:o:I:N:T:Uh" option; do
+    while getopts ":d:s:n:t:f:i:a:g:k:r:o:I:N:T:C:Uh" option; do
         case "$option" in
             d) DOMAIN="$OPTARG" ;;
             s) SELF_SIGNED="$OPTARG" ;;
@@ -64,6 +67,7 @@ read_parameters() {
             N) INSTALL_NAME="$OPTARG" ;;
             T) INSTALL_TARGET="$OPTARG" ;;
             U) UNINSTALL="1" ;;
+            C) NAME_CONSTRAINTS="$OPTARG" ;;
             h) display_usage; exit 0 ;;
             :) parameter_missing_error "Option -$OPTARG requires a value." ;;
             \?|*) parameter_missing_error "$ERR_UO: -$OPTARG" ;;
@@ -202,6 +206,46 @@ validate_install_name() {
     case "$1" in
         */*|.*) parameter_missing_error "$ERR_INST_NAME: ${1}" ;;
     esac
+}
+
+# -C becomes an openssl config value. A malformed entry would either be
+# rejected by openssl with an opaque message or, worse, build a constraint that
+# is not the one asked for — and a constraint that is subtly wrong is how a
+# certificate comes to be refused months later by a browser.
+# _trim <string> — surrounding whitespace only.
+#
+# Not `tr -d '[:space:]'`: that was the first version here and it deleted
+# INTERNAL spaces too, so a -C entry of 'has space' quietly became 'hasspace'
+# and passed validation as a hostname. Trimming the ends makes '.lan, .nip.io'
+# work; anything with a space left in the middle is then correctly refused.
+_trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+validate_name_constraints() {
+    [ -n "${1:-}" ] || return 0
+    local entry addr bits
+    local IFS=','
+    for entry in $1; do
+        entry="$(_trim "$entry")"
+        [ -n "$entry" ] || continue
+        case "$entry" in
+            */*)
+                addr="${entry%%/*}"; bits="${entry##*/}"
+                printf '%s' "$addr" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+                    || parameter_missing_error "$ERR_NC: ${entry}"
+                printf '%s' "$bits" | grep -qE '^([0-9]|[12][0-9]|3[0-2]|([0-9]{1,3}\.){3}[0-9]{1,3})$' \
+                    || parameter_missing_error "$ERR_NC: ${entry}"
+                ;;
+            *)
+                printf '%s' "$entry" | grep -qE '^\.?([A-Za-z0-9*_-]+\.)*[A-Za-z0-9*_-]+$' \
+                    || parameter_missing_error "$ERR_NC: ${entry}"
+                ;;
+        esac
+    done
 }
 
 validate_install_target() {

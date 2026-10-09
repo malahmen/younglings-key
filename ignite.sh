@@ -66,6 +66,7 @@ fi
 
 validate_domain "$DOMAIN"
 validate_numbits "$NUMBITS"                   # also lands in the template (-g 1)
+validate_name_constraints "$NAME_CONSTRAINTS" # -C, before any key is generated
 
 # ---- Mode 2: emit a .cfg template and exit ------------------------------------
 validate_template_flag "$TEMPLATE"

@@ -76,6 +76,50 @@ certificate_request_protocol_configured() {
 # True when `openssl req` supports -addext (OpenSSL >= 1.1.1, LibreSSL >= 3.1).
 _openssl_has_addext() { openssl req -help 2>&1 | grep -q -- '-addext'; }
 
+# _cidr_to_netmask <prefix-length> — 16 -> 255.255.0.0
+_cidr_to_netmask() {
+    local bits="$1" i out=""
+    for i in 1 2 3 4; do
+        if [ "$bits" -ge 8 ]; then out="${out}.255"; bits=$((bits - 8))
+        elif [ "$bits" -le 0 ]; then out="${out}.0"
+        else out="${out}.$(( 256 - 2 ** (8 - bits) ))"; bits=0
+        fi
+    done
+    printf '%s' "${out#.}"
+}
+
+# _name_constraints_ext — $NAME_CONSTRAINTS as openssl's nameConstraints value,
+# or exit 1 when none were asked for.
+#
+#   .lan            -> permitted;DNS:.lan
+#   192.168.0.0/16  -> permitted;IP:192.168.0.0/255.255.0.0
+#
+# The netmask conversion is not cosmetic: openssl REFUSES a CIDR prefix in this
+# extension (measured — 'IP:192.168.0.0/16' does not parse) while that is the
+# form everyone writes.
+#
+# critical, as RFC 5280 says it SHOULD be: a verifier that cannot read the
+# extension must reject the chain rather than ignore a constraint it did not
+# understand.
+_name_constraints_ext() {
+    local entry addr bits out=""
+    local IFS=','
+    for entry in $NAME_CONSTRAINTS; do
+        entry="$(_trim "$entry")"
+        [ -n "$entry" ] || continue
+        case "$entry" in
+            */*)
+                addr="${entry%%/*}"; bits="${entry##*/}"
+                case "$bits" in *.*) ;; *) bits="$(_cidr_to_netmask "$bits")" ;; esac
+                out="${out},permitted;IP:${addr}/${bits}"
+                ;;
+            *)  out="${out},permitted;DNS:${entry}" ;;
+        esac
+    done
+    [ -n "$out" ] || return 1
+    printf 'critical%s' "$out"
+}
+
 _build_ca() {
     if [ -f "$CERTIFICATES_PATH/ca.key" ] && [ -f "$CERTIFICATES_PATH/ca.crt" ]; then
         msg "Reusing existing CA: $CERTIFICATES_PATH/ca.crt (delete ca.key and ca.crt to regenerate)"
@@ -94,6 +138,21 @@ _build_ca() {
     if _openssl_has_addext; then
         ca_ext=(-addext "basicConstraints = critical, CA:TRUE, pathlen:0"
                 -addext "keyUsage = critical, keyCertSign, cRLSign")
+        # YK-7, opt-in and off by default. Reached only when a CA is being
+        # CREATED — the early return above reuses an existing one untouched —
+        # so this can never alter a CA already in a trust store, and
+        # certificates already issued are unaffected either way: the
+        # constraint lives on the CA and is evaluated at verification time,
+        # not baked into a leaf.
+        local nc
+        if nc="$(_name_constraints_ext)"; then
+            ca_ext+=(-addext "nameConstraints = ${nc}")
+            msg "CA name constraints: ${NAME_CONSTRAINTS}"
+            wrn "This CA can only issue for those names. Anything else is REFUSED by"
+            wrn "verifiers, not by the signing — including a single-label name such as"
+            wrn "'myhost', which is inside no DNS subtree. A name form left unmentioned"
+            wrn "(no IP range given, say) stays unconstrained."
+        fi
     else
         wrn "This openssl has no -addext: the CA will carry whatever extensions"
         wrn "it adds by default, which on LibreSSL is none. Browsers may refuse it."
@@ -158,6 +217,52 @@ _write_san_extfile() {
     printf 'subjectAltName = %s\n' "$san" > "$out"
 }
 
+# _constraint_report <crt> — the two lists, side by side, for the operator to
+# compare. Deliberately not an attempt to work out which SAN offended: see
+# _verify_issued on why the matching rules are not reimplemented here.
+_constraint_report() {
+    printf 'permitted by the CA:\n' 1>&2
+    openssl x509 -in "$CERTIFICATES_PATH/ca.crt" -noout -ext nameConstraints 2>/dev/null | sed 1d 1>&2
+    printf 'requested by this certificate:\n' 1>&2
+    openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null | sed 1d 1>&2
+}
+
+# _verify_issued <crt> — refuse to hand back a certificate the CA cannot
+# actually vouch for.
+#
+# The gap this closes: signing a leaf that violates the CA's name constraints
+# SUCCEEDS and exits 0. Only verification fails, with
+# "error 47 ... permitted subtree violation" — so without this the operator
+# gets a clean-looking .crt, distributes it, and finds out in a browser.
+#
+# The question is put to OpenSSL rather than reimplemented. RFC 5280
+# name-constraint matching has enough corners — a single-label name is inside
+# no DNS subtree; a name form the CA says nothing about is unconstrained; a
+# wildcard matches by labels, not by text — that a hand-rolled check would be
+# a second, subtly different opinion about the only thing that matters, which
+# is what the verifier will say.
+#
+# Any failure counts, not only a constraint violation: an expired CA, or one
+# whose basicConstraints will not permit signing, produces an equally useless
+# certificate and the reason is printed verbatim.
+_verify_issued() {
+    local crt="${1:?}" out
+    out="$(openssl verify -CAfile "$CERTIFICATES_PATH/ca.crt" "$crt" 2>&1)" && return 0
+    oerr "The CA cannot vouch for the certificate just issued:"
+    printf '%s\n' "$out" | sed 's/^/    /' 1>&2
+    case "$out" in
+        *"subtree violation"*)
+            _constraint_report "$crt"
+            wrn "Reissue with names inside the constraints, or build a CA without them"
+            wrn "(delete ca.key and ca.crt, then re-run without -C)."
+            ;;
+    esac
+    # Nothing half-valid is left behind: the caller asked for a usable
+    # certificate and did not get one.
+    rm -f "$crt"
+    execution_error "$ERR_ISSUE_VERIFY: $DOMAIN"
+}
+
 # Sign the CSR with the CA. By default `openssl x509 -req` drops the CSR's
 # extensions, so the SAN is carried over explicitly: -copy_extensions on
 # OpenSSL 3, an -extfile built from the CSR otherwise.
@@ -184,11 +289,17 @@ _sign_with_ca() {
         rm -f "${extf}.leaf"
         ext_opts=(-extfile "$extf")
     fi
+    # Written aside and only renamed once the CA is shown to vouch for it.
     execute openssl x509 -req -sha512 -days "$DURATION" "${ext_opts[@]}" \
         -CA "$CERTIFICATES_PATH/ca.crt" -CAkey "$CERTIFICATES_PATH/ca.key" -CAcreateserial \
         -in "$CERTIFICATES_PATH/$DOMAIN.csr" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.crt"
+        -out "$CERTIFICATES_PATH/$DOMAIN.crt.new"
+    # Before the verification, which exits on failure: otherwise a refused
+    # issuance left the .ext behind, the same stray-working-file symptom Y1
+    # reports for the IP path.
     rm -f "$CERTIFICATES_PATH/$DOMAIN.ext"
+    _verify_issued "$CERTIFICATES_PATH/$DOMAIN.crt.new"
+    execute mv -f "$CERTIFICATES_PATH/$DOMAIN.crt.new" "$CERTIFICATES_PATH/$DOMAIN.crt"
     execute openssl x509 -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.crt"
 }
 

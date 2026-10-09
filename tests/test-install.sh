@@ -130,6 +130,58 @@ if openssl x509 -in "$W/eku/code.lan.crt" -noout -ext extendedKeyUsage 2>/dev/nu
 then ok "a CSR's own EKU is not overridden"
 else bad "a CSR's own EKU was overridden"; fi
 
+# --- -C: name constraints, opt-in and NEW CAs only (YK-7) --------------------
+# The guarantee that matters: an existing CA is reused untouched, so -C can
+# never alter a CA already in a trust store and cannot affect certificates
+# already issued.
+run -d 'first.lan' -o "$W/nc" -i '/C=PT/O=T/CN=first.lan' >/dev/null 2>&1
+if openssl x509 -in "$W/nc/ca.crt" -noout -ext nameConstraints 2>/dev/null | grep -q 'Name Constraints'
+then bad "a CA built without -C carries name constraints"
+else ok "a CA built without -C has none"; fi
+ca_before="$(openssl x509 -in "$W/nc/ca.crt" -noout -fingerprint -sha256)"
+run -d 'second.lan' -o "$W/nc" -i '/C=PT/O=T/CN=second.lan' -C '.lan' >/dev/null 2>&1
+ca_after="$(openssl x509 -in "$W/nc/ca.crt" -noout -fingerprint -sha256)"
+if [ "$ca_before" = "$ca_after" ]; then ok "-C leaves an existing CA untouched"
+else bad "-C modified an existing CA"; fi
+if openssl verify -CAfile "$W/nc/ca.crt" "$W/nc/first.lan.crt" >/dev/null 2>&1
+then ok "a certificate issued before -C still verifies"
+else bad "-C invalidated an already-issued certificate"; fi
+
+# On a NEW CA the constraint is applied, critical, and CIDR is converted to the
+# netmask openssl actually accepts in this extension.
+run -d 'fresh.lan' -o "$W/nc2" -i '/C=PT/O=T/CN=fresh.lan' -C '.lan,192.168.0.0/16' >/dev/null 2>&1
+nc_ext="$(openssl x509 -in "$W/nc2/ca.crt" -noout -ext nameConstraints 2>/dev/null)"
+if printf '%s' "$nc_ext" | grep -q 'critical'; then ok "the constraint is marked critical"
+else bad "the constraint is not critical"; fi
+if printf '%s' "$nc_ext" | grep -q 'DNS:.lan'; then ok "the DNS suffix is permitted"
+else bad "the DNS suffix is missing: ${nc_ext}"; fi
+if printf '%s' "$nc_ext" | grep -q 'IP:192.168.0.0/255.255.0.0'
+then ok "a /16 became the netmask form openssl needs"
+else bad "the IP range was not converted: ${nc_ext}"; fi
+if openssl verify -CAfile "$W/nc2/ca.crt" "$W/nc2/fresh.lan.crt" >/dev/null 2>&1
+then ok "a name inside the constraints verifies"
+else bad "a name inside the constraints does not verify"; fi
+
+# The pre-flight (the point of it): signing a violating leaf SUCCEEDS, so
+# without the check an unusable .crt would be handed back looking fine.
+out="$(run -d 'outside.example.com' -o "$W/nc3" -i '/C=PT/O=T/CN=outside.example.com' -C '.lan')"
+if printf '%s' "$out" | grep -q 'cannot vouch for the certificate'; then ok "a violating name is refused at issue time"
+else bad "a violating name was issued: ${out}"; fi
+if printf '%s' "$out" | grep -q 'subtree violation'; then ok "  and the verifier's reason is shown"
+else bad "  without the reason"; fi
+if [ -f "$W/nc3/outside.example.com.crt" ]; then bad "  but the .crt was written anyway"
+else ok "  and no .crt is left behind"; fi
+if ls "$W/nc3"/*.crt.new >/dev/null 2>&1 || ls "$W/nc3"/*.ext >/dev/null 2>&1
+then bad "  working files were left behind"
+else ok "  nor any working files"; fi
+
+# -C validation
+for badc in '192.168.0.0/33' 'has space' 'bad!entry' '1.2.3/16'; do
+    out="$(run -d 'x.lan' -o "$W/ncv" -i '/C=PT/O=T/CN=x.lan' -C "$badc")"
+    if printf '%s' "$out" | grep -q 'Invalid -C entry'; then ok "-C rejects '${badc}'"
+    else bad "-C accepted '${badc}'"; fi
+done
+
 # --- -U is validated like -I (YK-6) ------------------------------------------
 # The removal itself needs root and a real store, so only the refusals are
 # asserted here; the rest is covered by the engine's own harness.

@@ -13,4 +13,5 @@ OUTPUT_DIR=""                   # output directory (-o); empty = ./certificates
 INSTALL_FILE=""                 # certificate to install into the trust store (-I)
 INSTALL_NAME=""                 # filename to install it as (-N); empty = basename
 UNINSTALL="0"                   # -U: remove instead of install
+NAME_CONSTRAINTS=""             # -C: limit a NEW CA to these names (empty = unconstrained)
 INSTALL_TARGET="all"            # where -I installs: system | nss | all (-T)

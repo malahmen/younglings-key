@@ -101,6 +101,42 @@ Like the install, it verifies rather than assumes — afterwards the certificate
 must no longer verify against the system store. If it still does, a copy is
 installed under some other name and that is reported instead of being hidden.
 
+## Limiting what a CA may issue for
+
+`-C` adds `nameConstraints` to a CA, so a verifier refuses any certificate from
+it whose names fall outside the list. It is off by default and applies **only
+when a CA is created** — an existing `ca.key`/`ca.crt` pair is reused untouched,
+so `-C` can never alter a CA already in a trust store, and certificates already
+issued are unaffected either way: the constraint lives on the CA and is checked
+at verification time, not baked into a leaf.
+
+```sh
+./ignite.sh -d 'host.lan' -C '.lan,192.168.0.0/16'      # DNS suffix + an IP range
+```
+
+A `/16` is converted to the dotted netmask this extension actually requires —
+openssl refuses a CIDR prefix here, which is the form everyone writes.
+
+Three things are easy to get wrong, so they are worth stating:
+
+- **A single-label name is inside no DNS subtree.** `DNS:.lan` does not permit
+  `myhost`. If a certificate needs a bare hostname SAN, DNS cannot be
+  constrained.
+- **A name form you do not mention stays unconstrained.** Give only DNS
+  suffixes and any `IP:` SAN is accepted; add an IP range and every IP SAN must
+  fall inside it — including `127.0.0.1`, which is not in RFC 1918.
+- **A public domain in the list permits all of it.** Constraining to `.nip.io`
+  so that `*.192.168.3.52.nip.io` keeps working also permits
+  `anything.1.2.3.4.nip.io`, which is most of the value gone. Constraints suit a
+  CA whose names are genuinely private.
+
+Issuance is checked against the CA before anything is written. Signing a
+violating certificate **succeeds** — only verification fails, with
+`error 47 ... permitted subtree violation` — so without that check you would
+get a clean-looking `.crt` and discover the problem in a browser. Any other
+reason the CA cannot vouch for the leaf (an expired CA, for instance) is
+reported the same way, verbatim, and no file is written.
+
 ### Two separate trust systems
 
 Installing into the system store and expecting browsers to follow is the mistake
@@ -196,6 +232,7 @@ what was intended.
 | `-N INSTALL_NAME` | Filename to install it as (default: `younglings-<fingerprint8>.crt`). No `/` and no leading `.` |
 | `-T INSTALL_TARGET` | Where `-I`/`-U` acts: `system`, `nss`, or `all` (default) |
 | `-U` | With `-I`: **remove** that certificate from the store instead of installing it |
+| `-C NAME_CONSTRAINTS` | Limit a **newly built** CA to these names, comma-separated (`.lan,.nip.io,192.168.0.0/16`). Off by default |
 | `-h` | Show help and exit | — |
 
 **Domains** (`-d`) may be a regular hostname (`example.com`, `sub.example.com`),
