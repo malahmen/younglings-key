@@ -52,7 +52,7 @@ run()  { bash "$ENGINE" "$@" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g'; }
 # sourced, which is BEFORE the flags are parsed. Without resolve_paths(), -o
 # parses cleanly, changes nothing, and the key lands in ./certificates — telling
 # the caller it went somewhere it did not.
-cd "$W"
+cd "$W" || exit 1
 run -d 'test.lan' -o "$OUT" -i '/C=PT/O=T/CN=test.lan' >/dev/null
 if [ -s "$OUT/test.lan.crt" ]; then ok "-o writes into the chosen directory"
 else bad "-o did not produce $OUT/test.lan.crt"; fi

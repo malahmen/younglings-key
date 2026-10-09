@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs every tests/test-*.sh. Non-zero exit if any fails.
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 rc=0
 for t in test-*.sh; do
     if bash "$t" >/tmp/yk-$t.log 2>&1; then
