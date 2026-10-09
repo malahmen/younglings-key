@@ -43,7 +43,11 @@ command -v openssl >/dev/null 2>&1 || execution_error "$ERR_OPENSSL"
 # other check: validating a domain the caller never supplied would reject a
 # perfectly good install.
 if [ -n "$INSTALL_FILE" ]; then
-    install_certificate_protocol
+    if [ "${UNINSTALL:-0}" = "1" ]; then
+        uninstall_certificate_protocol
+    else
+        install_certificate_protocol
+    fi
     exit 0
 fi
 

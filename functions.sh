@@ -18,6 +18,7 @@ display_usage() {
     -o OUTPUT_DIR         Where to write output (default ./certificates)
     -I INSTALL_FILE       Install this certificate (see -T; system store needs root)
     -N INSTALL_NAME       Filename to install it as (default: younglings-<fingerprint>.crt)
+    -U                    With -I: REMOVE that certificate from the store instead
     -T INSTALL_TARGET     Where -I installs: system, nss, or all (default all)
     -h                    Show this help and exit
 EOF
@@ -46,7 +47,7 @@ parameter_missing_error() {
 # Function: read parameters from the command line.
 read_parameters() {
     local option
-    while getopts ":d:s:n:t:f:i:a:g:k:r:o:I:N:T:h" option; do
+    while getopts ":d:s:n:t:f:i:a:g:k:r:o:I:N:T:Uh" option; do
         case "$option" in
             d) DOMAIN="$OPTARG" ;;
             s) SELF_SIGNED="$OPTARG" ;;
@@ -62,6 +63,7 @@ read_parameters() {
             I) INSTALL_FILE="$OPTARG" ;;
             N) INSTALL_NAME="$OPTARG" ;;
             T) INSTALL_TARGET="$OPTARG" ;;
+            U) UNINSTALL="1" ;;
             h) display_usage; exit 0 ;;
             :) parameter_missing_error "Option -$OPTARG requires a value." ;;
             \?|*) parameter_missing_error "$ERR_UO: -$OPTARG" ;;

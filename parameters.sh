@@ -12,4 +12,5 @@ PRIVATE_KEY=""                  # .key to pair with -r for a .pem (-k)
 OUTPUT_DIR=""                   # output directory (-o); empty = ./certificates
 INSTALL_FILE=""                 # certificate to install into the trust store (-I)
 INSTALL_NAME=""                 # filename to install it as (-N); empty = basename
+UNINSTALL="0"                   # -U: remove instead of install
 INSTALL_TARGET="all"            # where -I installs: system | nss | all (-T)
