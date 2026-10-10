@@ -1,5 +1,7 @@
 # younglings-key
 
+[![ci](https://github.com/malahmen/younglings-key/actions/workflows/ci.yml/badge.svg)](https://github.com/malahmen/younglings-key/actions/workflows/ci.yml)
+
 **`ignite.sh` — certificate generation, simplified.**
 
 A small, gum-free, **flag-driven** CLI around `openssl`. It generates certificate
@@ -268,16 +270,57 @@ For a domain `example.com`, `./certificates/` will contain, depending on the mod
 `.pem` bundles contain the **private key** followed by the certificate, so they are
 written with `0600` permissions — keep them out of version control.
 
+### What a signed leaf carries
+
+A CA-signed leaf is given the extensions that say it is a leaf, where the CSR
+has not already said so itself:
+
+| Extension | Value |
+| --- | --- |
+| `basicConstraints` | `critical, CA:FALSE` |
+| `keyUsage` | `critical, digitalSignature, keyEncipherment` |
+| `extendedKeyUsage` | `serverAuth, clientAuth` |
+
+Only where the CSR is **silent**. If your config file or template already
+requests any of the three, yours is kept — the point is to stop a leaf going
+out with no constraints at all, not to override what you asked for.
+
+Without `CA:FALSE` a leaf is, formally, a certificate that could sign others.
+Most clients will not honour that, but "most" is not a property worth relying
+on, and it costs one line in an extfile to be unambiguous.
+
+This applies to certificates signed **from now on**. Nothing re-issues or
+invalidates a certificate you already have — the extensions are written at
+signing time, so an existing leaf keeps whatever it was signed with.
+
 ## Testing
 
 ```sh
 tests/run-all.sh        # every tests/test-*.sh; non-zero exit if any fails
 ```
 
-Everything there runs as an ordinary user against temporary directories: what
-`-I` refuses, that `-o` is honoured, that the leaf is CA-signed and carries a
-SAN, that NSS discovery never returns an unexpanded glob, and that `nss_home`
-follows `$SUDO_USER`.
+**45 checks.** Everything there runs as an ordinary user against temporary
+directories: what `-I` refuses, that `-o` is honoured, that the leaf is
+CA-signed and carries a SAN and the extensions above, that NSS discovery never
+returns an unexpanded glob, and that `nss_home` follows `$SUDO_USER`.
+
+One part of it is about the suite rather than the tool, and exists because the
+suite used to be the bug. The `-T` acceptance checks ran `-I ca.crt -T nss`
+just to see whether the flag parsed — and that performs the **whole install**,
+so every run added a throwaway CA to every NSS database on the machine and then
+deleted its key. On the author's laptop that is five databases: `~/.pki/nssdb`
+plus four Flatpak browsers.
+
+Two defences now. The flag checks call the validators directly instead of
+running an install. And `certutil`, `update-ca-trust`,
+`update-ca-certificates` and `trust` are **shadowed on `PATH` by hard
+failures** (exit 97), so a future edit that reintroduces a real install fails
+the suite instead of quietly modifying the machine it runs on.
+
+The NSS install is also read back with `certutil -L -n <nickname>` rather than
+trusted to a zero exit status, and the read-back looks for the nickname in the
+listing body. An earlier version matched against `certutil`'s own column
+header, which is present whether or not anything was installed.
 
 The *successful* installs need root and a real store, so they are checked in
 containers of both families — `verification failed` before, `OK` after:
@@ -286,6 +329,18 @@ containers of both families — `verification failed` before, `OK` after:
 podman run --rm -v "$PWD:/e:ro" registry.fedoraproject.org/fedora:41 \
   bash -c 'dnf -q -y install openssl ca-certificates nss-tools && bash /e/ignite.sh -I /e/ca.crt'
 ```
+
+### CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `shellcheck -x` on
+`ignite.sh` and the whole suite, on every push to `main`, every pull request,
+and on demand. `-x` matters here: this tool is a sourced-file program, so shellcheck has to
+follow the `source` chain to see one program instead of nine files of
+apparently undefined variables. `shellcheck *.sh` reports **102** findings that
+are all that same non-problem; `shellcheck -x ignite.sh` reports **0**.
+
+The container checks above are **not** in CI; they need root and a real trust
+store, so they stay a manual step.
 
 ## Project layout
 
@@ -308,4 +363,4 @@ interactive prompts), so it stays scriptable.
 
 ## License
 
-Released under the [Unlicense](LICENSE).
+[MIT](LICENSE) © 2026 malahmen.
