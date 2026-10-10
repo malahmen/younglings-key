@@ -38,6 +38,15 @@ resolve_paths
 # openssl is the only hard dependency.
 command -v openssl >/dev/null 2>&1 || execution_error "$ERR_OPENSSL"
 
+# ---- Mode -1: relocate the CA key into its 0700 directory ---------------------
+# Before everything else, for the same reason as -I: it needs no domain and
+# generates nothing, so validating a domain the caller never gave would reject
+# a perfectly good move.
+if [ "${RELOCATE_CA:-0}" = "1" ]; then
+    relocate_ca_protocol
+    exit 0
+fi
+
 # ---- Mode 0: install an existing certificate into the trust store -------------
 # Chosen by -I. Takes no domain and generates nothing, so it runs before every
 # other check: validating a domain the caller never supplied would reject a
@@ -90,6 +99,11 @@ fi
 if [ "$SELF_SIGNED" = "1" ]; then
     validate_subject "$SUBJECT_CA"            # self-signed needs a CA subject
     validate_duration "$DURATION"
+    validate_ca_duration "$CA_DURATION"
+    # Before any key is generated: a passphrase file that turns out to be
+    # unreadable, empty or world-readable after the CA exists leaves a key
+    # nothing can use, or one that is not really protected.
+    validate_passphrase_file "$CA_PASSPHRASE_FILE"
     self_signed_protocol
 else
     certificate_request_protocol

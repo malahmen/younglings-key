@@ -120,12 +120,148 @@ _name_constraints_ext() {
     printf 'critical%s' "$out"
 }
 
-_build_ca() {
-    if [ -f "$CERTIFICATES_PATH/ca.key" ] && [ -f "$CERTIFICATES_PATH/ca.crt" ]; then
-        msg "Reusing existing CA: $CERTIFICATES_PATH/ca.crt (delete ca.key and ca.crt to regenerate)"
+# ---- Where the CA private key lives (YK-7) -----------------------------------
+#
+# The key moved out of the output directory into a 0700 subdirectory of it. It
+# used to sit beside the leaves, in a directory whose mode nothing set, next to
+# files that are meant to be copied around — and a CA key in a homelab is the
+# one secret that can impersonate every name its constraints allow, on every
+# machine that trusts the anchor.
+#
+# The CA CERTIFICATE deliberately does NOT move. It is public, and other things
+# read it by path: kuat's lan_tls role expects
+# ~/.local/share/kuat-pki/ca.crt. Only the key is relocated, which is the half
+# that needed protecting.
+#
+# An existing key at the old path keeps being used, with a message. Moving
+# somebody's CA key without being asked is not a thing to do silently, and a
+# CA that regenerated itself because the key "went missing" would invalidate
+# every certificate already trusted. -R does the move deliberately.
+_ca_private_dir() { printf '%s' "$CERTIFICATES_PATH/ca-private"; }
+_ca_key_new()     { printf '%s' "$(_ca_private_dir)/ca.key"; }
+_ca_key_legacy()  { printf '%s' "$CERTIFICATES_PATH/ca.key"; }
+_ca_crt()         { printf '%s' "$CERTIFICATES_PATH/ca.crt"; }
+
+# The CA key in use: the protected location if it is there, the old one
+# otherwise, and the protected one for a CA that does not exist yet.
+_ca_key_path() {
+    if [ -f "$(_ca_key_new)" ]; then _ca_key_new
+    elif [ -f "$(_ca_key_legacy)" ]; then _ca_key_legacy
+    else _ca_key_new
+    fi
+}
+
+# Is this key file encrypted? Both PEM shapes openssl writes have to be
+# recognised: the traditional "Proc-Type: 4,ENCRYPTED" header and PKCS#8's
+# "BEGIN ENCRYPTED PRIVATE KEY". Checked by reading the file rather than by
+# remembering whether -E was passed, because the key may have been made by an
+# earlier run, by -R, or by hand.
+_ca_key_is_encrypted() {
+    local key="${1:?}"
+    [ -f "$key" ] || return 1
+    grep -q 'ENCRYPTED' "$key"
+}
+
+# The passphrase source openssl should use, as a -pass* argument value.
+#
+# A passphrase is never taken from the command line: argv is readable by any
+# process on the machine for as long as openssl runs. A file is, so that this
+# stays scriptable — the intended split is the key on this host and the
+# passphrase somewhere else (an ansible vault, a password manager), so that
+# taking the key is not enough on its own.
+_ca_pass_arg() {
+    if [ -n "$CA_PASSPHRASE_FILE" ]; then printf 'file:%s' "$CA_PASSPHRASE_FILE"; return 0; fi
+    if [ -n "${YOUNGLINGS_CA_PASSPHRASE_FILE:-}" ]; then
+        printf 'file:%s' "$YOUNGLINGS_CA_PASSPHRASE_FILE"; return 0
+    fi
+    # No file given: openssl prompts on the terminal. Refused without one,
+    # rather than falling back to an empty passphrase, which would produce a
+    # file that merely looks encrypted.
+    if [ -t 0 ]; then printf 'stdin-prompt'; return 0; fi
+    return 1
+}
+
+# _ca_set_pass_opts passin|passout -- sets YK_PASS_OPTS to the openssl
+# arguments for an encrypted key, or to nothing when openssl should prompt.
+#
+# A global array and not a command substitution, which is how this was first
+# written and was wrong in the worst available way: execution_error inside
+# $( ) or < <( ) exits only the SUBSHELL. The error was printed, mapfile read
+# nothing, and the caller then ran `openssl genrsa -aes256` with no passphrase
+# argument at all -- which prompts, takes whatever it is handed, and writes a
+# key. Measured: with -E, no -p and stdin on /dev/null, the refusal appeared
+# and a key was created anyway.
+YK_PASS_OPTS=()
+_ca_set_pass_opts() {
+    local which="${1:?}" src
+    YK_PASS_OPTS=()
+    if ! src="$(_ca_pass_arg)"; then
+        execution_error "$ERR_CA_PASS"
+    fi
+    [ "$src" = "stdin-prompt" ] && return 0        # let openssl prompt
+    YK_PASS_OPTS=("-${which}" "$src")
+}
+
+# -R: move an existing CA key from the output directory into the 0700 one.
+relocate_ca_protocol() {
+    local legacy new
+    legacy="$(_ca_key_legacy)"; new="$(_ca_key_new)"
+    if [ -f "$new" ]; then
+        msg "The CA key is already protected: $new"
+        [ -f "$legacy" ] && wrn "There is ALSO a key at $legacy — delete it by hand once you have checked they match."
         return 0
     fi
-    execute openssl genrsa -out "$CERTIFICATES_PATH/ca.key" "$NUMBITS"
+    [ -f "$legacy" ] || execution_error "$ERR_CA_NOKEY: $legacy"
+    execute mkdir -p "$(_ca_private_dir)"
+    execute chmod 700 "$(_ca_private_dir)"
+    # mv, not cp: leaving a copy behind would defeat the point, and the mode
+    # is set after the move because mv preserves the old one.
+    execute mv "$legacy" "$new"
+    execute chmod 600 "$new"
+    msg "CA key moved: $legacy -> $new"
+    msg "The CA certificate stayed at $(_ca_crt) — things read it by that path."
+}
+
+_build_ca() {
+    local ca_key; ca_key="$(_ca_key_path)"
+    if [ -f "$ca_key" ] && [ -f "$(_ca_crt)" ]; then
+        msg "Reusing existing CA: $(_ca_crt) (delete $ca_key and ca.crt to regenerate)"
+        if [ "$ca_key" = "$(_ca_key_legacy)" ]; then
+            wrn "Its key sits beside the leaves in $CERTIFICATES_PATH, in a directory whose"
+            wrn "mode nothing here set. Move it under a 0700 directory with:  ignite.sh -R -o $CERTIFICATES_PATH"
+        fi
+        if [ "$ENCRYPT_CA" = "1" ] && ! _ca_key_is_encrypted "$ca_key"; then
+            wrn "-E only applies to a CA being created; this one already exists and its key"
+            wrn "is unencrypted. Encrypt it in place with:  openssl rsa -aes256 -in $ca_key -out $ca_key.enc"
+        fi
+        return 0
+    fi
+
+    # A new CA: key in the 0700 directory from the start, so it is never
+    # written to a world-traversable path even briefly.
+    execute mkdir -p "$(_ca_private_dir)"
+    execute chmod 700 "$(_ca_private_dir)"
+    ca_key="$(_ca_key_new)"
+    if [ "$ENCRYPT_CA" = "1" ]; then
+        _ca_set_pass_opts passout
+        execute openssl genrsa -aes256 "${YK_PASS_OPTS[@]+${YK_PASS_OPTS[@]}}" -out "$ca_key" "$NUMBITS"
+        # Read back, and the file is REMOVED when it is not encrypted. openssl
+        # accepts an empty passphrase from a prompt that hit EOF and writes a
+        # perfectly usable unencrypted key; leaving that behind would mean the
+        # next run reuses it and never asks again.
+        if ! _ca_key_is_encrypted "$ca_key"; then
+            rm -f "$ca_key"
+            execution_error "$ERR_CA_ENC"
+        fi
+        msg "CA key encrypted (AES-256): $ca_key"
+    else
+        execute openssl genrsa -out "$ca_key" "$NUMBITS"
+        wrn "The CA key is NOT encrypted. Anything that can read $ca_key can issue a"
+        wrn "certificate for any name this CA is allowed to sign, on every machine that"
+        wrn "trusts it. Pass -E (with -p FILE or YOUNGLINGS_CA_PASSPHRASE_FILE) to"
+        wrn "encrypt it, keeping the passphrase somewhere the key is not."
+    fi
+    execute chmod 600 "$ca_key"
 
     # The CA says what it is, explicitly, instead of relying on what each
     # openssl adds by default — and they differ:
@@ -157,11 +293,26 @@ _build_ca() {
         wrn "This openssl has no -addext: the CA will carry whatever extensions"
         wrn "it adds by default, which on LibreSSL is none. Browsers may refuse it."
     fi
-    execute openssl req -x509 -new -nodes -sha512 -days "$DURATION" \
+    # -days $CA_DURATION, not $DURATION: -t sets how long a LEAF lives, and
+    # the two want different numbers. They shared one value, so shortening the
+    # leaf to something browsers accept also shortened the root, and every
+    # machine trusting the anchor would have to be revisited.
+    #
+    # -nodes drops out when the key is encrypted: it means "no DES", i.e. do
+    # not encrypt, and openssl would otherwise need the passphrase to read the
+    # key it was just given.
+    if _ca_key_is_encrypted "$ca_key"; then
+        _ca_set_pass_opts passin
+    else
+        YK_PASS_OPTS=(-nodes)
+    fi
+    execute openssl req -x509 -new -sha512 -days "$CA_DURATION" \
         -subj "$SUBJECT_CA" \
         "${ca_ext[@]+${ca_ext[@]}}" \
-        -key "$CERTIFICATES_PATH/ca.key" \
-        -out "$CERTIFICATES_PATH/ca.crt"
+        "${YK_PASS_OPTS[@]+${YK_PASS_OPTS[@]}}" \
+        -key "$ca_key" \
+        -out "$(_ca_crt)"
+    msg "CA valid for $CA_DURATION days: $(_ca_crt)"
 }
 
 # SAN entry used when the CSR is built from a subject string (-i): an IPv4
@@ -290,8 +441,13 @@ _sign_with_ca() {
         ext_opts=(-extfile "$extf")
     fi
     # Written aside and only renamed once the CA is shown to vouch for it.
+    local ca_key
+    ca_key="$(_ca_key_path)"
+    YK_PASS_OPTS=()
+    if _ca_key_is_encrypted "$ca_key"; then _ca_set_pass_opts passin; fi
     execute openssl x509 -req -sha512 -days "$DURATION" "${ext_opts[@]}" \
-        -CA "$CERTIFICATES_PATH/ca.crt" -CAkey "$CERTIFICATES_PATH/ca.key" -CAcreateserial \
+        "${YK_PASS_OPTS[@]+${YK_PASS_OPTS[@]}}" \
+        -CA "$(_ca_crt)" -CAkey "$ca_key" -CAcreateserial \
         -in "$CERTIFICATES_PATH/$DOMAIN.csr" \
         -out "$CERTIFICATES_PATH/$DOMAIN.crt.new"
     # Before the verification, which exits on failure: otherwise a refused
