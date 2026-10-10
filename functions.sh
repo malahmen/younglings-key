@@ -8,7 +8,8 @@ display_usage() {
     -d DOMAIN              Domain to certify: hostname, *.wildcard or IPv4 — required
     -s SELF_SIGNED        1 = self-signed certificate (default), 0 = CSR only
     -n NUMBITS            RSA key size: 2048 (default), 3072, or 4096
-    -t DURATION           Certificate validity in days (self-signed; 1-3650)
+    -t DURATION           LEAF validity in days (self-signed; 1-3650, default 398)
+    -c CA_DURATION        CA validity in days (1-7300, default 3650)
     -f CONFIGURATION_FILE openssl config file (mutually exclusive with -i)
     -i SUBJECT            Subject string, e.g. /C=PT/O=Acme/CN=example.com (with -f: -f wins)
     -a SUBJECT_CA         CA subject string (self-signed only)
@@ -23,7 +24,16 @@ display_usage() {
                           (e.g. '.lan,.nip.io,192.168.0.0/16'); existing CAs are
                           reused untouched, so this never affects one already in use
     -T INSTALL_TARGET     Where -I installs: system, nss, or all (default all)
+    -E                    Encrypt a NEW CA key with AES-256 (needs -p or a terminal)
+    -p CA_PASSPHRASE_FILE File holding the CA key passphrase (never passed on argv);
+                          YOUNGLINGS_CA_PASSPHRASE_FILE does the same
+    -R                    Move an existing CA key into the 0700 ca-private/ directory
+                          (the CA certificate stays where it is) and exit
     -h                    Show this help and exit
+
+  The CA private key lives in <output>/ca-private/ (mode 0700); the CA
+  certificate stays at <output>/ca.crt, because other tools read it by path.
+  A key found at the old <output>/ca.key is reused with a warning — see -R.
 EOF
 }
 
@@ -50,12 +60,13 @@ parameter_missing_error() {
 # Function: read parameters from the command line.
 read_parameters() {
     local option
-    while getopts ":d:s:n:t:f:i:a:g:k:r:o:I:N:T:C:Uh" option; do
+    while getopts ":d:s:n:t:c:f:i:a:g:k:r:o:I:N:T:C:p:EURh" option; do
         case "$option" in
             d) DOMAIN="$OPTARG" ;;
             s) SELF_SIGNED="$OPTARG" ;;
             n) NUMBITS="$OPTARG" ;;
             t) DURATION="$OPTARG" ;;
+            c) CA_DURATION="$OPTARG" ;;
             f) CONFIGURATION_FILE="$OPTARG" ;;
             i) SUBJECT="$OPTARG" ;;
             a) SUBJECT_CA="$OPTARG" ;;
@@ -68,6 +79,9 @@ read_parameters() {
             T) INSTALL_TARGET="$OPTARG" ;;
             U) UNINSTALL="1" ;;
             C) NAME_CONSTRAINTS="$OPTARG" ;;
+            E) ENCRYPT_CA="1" ;;
+            p) CA_PASSPHRASE_FILE="$OPTARG" ;;
+            R) RELOCATE_CA="1" ;;
             h) display_usage; exit 0 ;;
             :) parameter_missing_error "Option -$OPTARG requires a value." ;;
             \?|*) parameter_missing_error "$ERR_UO: -$OPTARG" ;;
@@ -108,6 +122,34 @@ validate_self_signed() {
 validate_numbits() {
     local numbits="${1:-}"
     printf '%s' "$numbits" | grep -Eq '^(2048|3072|4096)$' || execution_error "$ERR_BN_I"
+}
+
+# Function: validate the CA duration (integer days, 1-7300).
+# A wider ceiling than a leaf's on purpose: a root is long-lived because
+# shortening it means re-distributing the anchor, not because it is safer.
+validate_ca_duration() {
+    local days="${1:-}"
+    if ! printf '%s' "$days" | grep -Eq '^[0-9]+$'; then execution_error "$ERR_CAD_I"; fi
+    if [ "$days" -lt 1 ] || [ "$days" -gt 7300 ]; then execution_error "$ERR_CAD_I"; fi
+}
+
+# Function: validate the CA passphrase file.
+#
+# The mode is checked, not just the existence: a passphrase file anyone can
+# read turns the encryption into decoration, and this is the one place that
+# can notice before a key is written.
+validate_passphrase_file() {
+    local file="${1:-}" mode
+    [ -n "$file" ] || return 0
+    [ -f "$file" ] || execution_error "$ERR_CA_PASSF_FNF: $file"
+    [ -s "$file" ] || execution_error "$ERR_CA_PASSF_EMPTY: $file"
+    mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null || echo '')"
+    case "$mode" in
+        ''|*[!0-9]*) wrn "Could not read the mode of $file - check it is not world-readable." ;;
+        *) if [ "$(( 8#$mode & 8#077 ))" -ne 0 ]; then
+               execution_error "$ERR_CA_PASSF_MODE: $file (mode $mode)"
+           fi ;;
+    esac
 }
 
 # Function: validate the certificate duration (integer days, 1-3650).

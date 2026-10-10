@@ -103,6 +103,69 @@ Like the install, it verifies rather than assumes — afterwards the certificate
 must no longer verify against the system store. If it still does, a copy is
 installed under some other name and that is reported instead of being hidden.
 
+## Protecting the CA key
+
+The CA key is the one secret here that matters: anything that can read it can
+issue a certificate for any name the CA is allowed to sign, on every machine
+that trusts the anchor. `pathlen:0` and `-C` limit **what it may sign**, which
+is not the same as protecting it.
+
+Three things, two of them unconditional:
+
+**It lives in its own `0700` directory.** `<output>/ca-private/ca.key`, mode
+`0600`. It used to sit in the output directory beside the leaves — among the
+files you copy around — in a directory whose mode nothing set.
+
+The CA **certificate** deliberately does not move: it stays at
+`<output>/ca.crt`, because it is public and other things read it by that path.
+
+**Leaf and CA lifetimes are separate.** `-t` is the leaf, default **398 days**;
+`-c` is the CA, default **3650**. They used to share one value. 398 and not
+3650 because Apple platforms refuse any certificate issued after 2019-07-01
+with a lifetime over 825 days, whatever root signed it — so a ten-year leaf was
+already unusable on macOS and iOS while looking fine in Chrome and Firefox. 398
+is the current public maximum, which keeps one certificate usable everywhere
+and makes renewal a habit rather than an event. `-t 3650` is still accepted for
+a host nothing Apple will ever talk to.
+
+A root stays long-lived on purpose. Shortening it does not reduce what a leaked
+key can do; it only means re-distributing the anchor to every machine and
+browser profile that trusts it.
+
+**`-E` encrypts the key** (AES-256), for a CA being created:
+
+```sh
+umask 077; printf '%s\n' "$(openssl rand -base64 32)" > ~/ca.pass
+./ignite.sh -d 'host.lan' -i '/C=PT/O=Acme/CN=host.lan' -E -p ~/ca.pass
+```
+
+The passphrase comes from a **file**, or from `YOUNGLINGS_CA_PASSPHRASE_FILE`,
+or from a terminal prompt — never from a flag. There is no option that takes
+the passphrase itself, because `argv` is readable by every process on the
+machine for as long as `openssl` runs.
+
+That is only worth doing if the passphrase lives somewhere the key does not —
+an Ansible vault, a password manager, another host. Both in the same directory
+is a speed bump, not a defence.
+
+The refusals are all before anything is written: a passphrase file that is
+missing, empty, or readable by others stops the run, and `-E` with no
+passphrase source and no terminal to prompt on is an error rather than a
+fallback. Without `-E`, an unencrypted CA key is created with a warning saying
+exactly what that means.
+
+**Already have a CA?** Its key keeps being used wherever it is, with a warning,
+because a CA that regenerated itself because the key "went missing" would
+invalidate every certificate already trusted. `-R` moves it deliberately:
+
+```sh
+./ignite.sh -R -o ~/.local/share/kuat-pki     # ca.key -> ca-private/ca.key
+```
+
+`-R` is a `mv`, not a copy — leaving one behind would defeat the point — and the
+CA certificate stays where it was. Encrypting an existing key is a one-liner
+the warning prints; this tool will not rewrite a key it did not create.
+
 ## Limiting what a CA may issue for
 
 `-C` adds `nameConstraints` to a CA, so a verifier refuses any certificate from
@@ -222,7 +285,8 @@ what was intended.
 | `-d DOMAIN` | Domain to certify: a hostname, a `*.` wildcard, or an IPv4 address (see below) — **required** | — |
 | `-s SELF_SIGNED` | `1` = self-signed, `0` = CSR only | `1` |
 | `-n NUMBITS` | RSA key size: `2048`, `3072`, or `4096` (validated in every mode, including `-g 1`, where it becomes the template's `default_bits`) | `2048` |
-| `-t DURATION` | Validity in days for self-signed certs (`1`–`3650`) | `3650` |
+| `-t DURATION` | **Leaf** validity in days (`1`–`3650`) | `398` |
+| `-c CA_DURATION` | **CA** validity in days (`1`–`7300`) | `3650` |
 | `-f CONFIGURATION_FILE` | `openssl` config file (mutually exclusive with `-i`; if both, `-f` wins) | — |
 | `-i SUBJECT` | Subject string, e.g. `/C=PT/O=Acme/CN=example.com` | — |
 | `-a SUBJECT_CA` | CA subject string (self-signed only; ignored when an existing CA is reused) | a placeholder CA |
@@ -235,6 +299,9 @@ what was intended.
 | `-T INSTALL_TARGET` | Where `-I`/`-U` acts: `system`, `nss`, or `all` (default) |
 | `-U` | With `-I`: **remove** that certificate from the store instead of installing it |
 | `-C NAME_CONSTRAINTS` | Limit a **newly built** CA to these names, comma-separated (`.lan,.nip.io,192.168.0.0/16`). Off by default |
+| `-E` | Encrypt a **newly built** CA key with AES-256. Needs `-p` or a terminal | off |
+| `-p CA_PASSPHRASE_FILE` | File holding the CA key passphrase. `YOUNGLINGS_CA_PASSPHRASE_FILE` does the same | — |
+| `-R` | Move an existing CA key into the `0700` `ca-private/` directory, then exit | — |
 | `-h` | Show help and exit | — |
 
 **Domains** (`-d`) may be a regular hostname (`example.com`, `sub.example.com`),
@@ -252,17 +319,18 @@ config's `req_ext`/`alt_names` section and is copied from the CSR into the signe
 `-extfile`). The `-g 1` template pre-fills `alt_names` to match the domain: the host
 plus `www.` for hostnames, the wildcard plus its apex, or `IP.1` for an address.
 
-**CA reuse.** In self-signed mode, an existing `./certificates/ca.key` + `ca.crt` pair
-is reused, so certificates issued on later runs are trusted by the same CA you
-already installed. To start over with a fresh CA, delete `ca.key` and `ca.crt`.
+**CA reuse.** In self-signed mode, an existing CA key + `ca.crt` pair is reused,
+so certificates issued on later runs are trusted by the same CA you already
+installed. To start over with a fresh CA, delete both.
 
 ## Output files
 
 For a domain `example.com`, `./certificates/` will contain, depending on the mode:
 
 - **CSR mode**: `example.com.key`, `example.com.csr`
-- **Self-signed**: `ca.key`, `ca.crt`, `ca.srl`, `example.com.key`, `example.com.csr`,
-  `example.com.crt`, `example.com.cert`, `example.com.pem`
+- **Self-signed**: `ca-private/ca.key` (mode `0600`, in a `0700` directory),
+  `ca.crt`, `ca.srl`, `example.com.key`, `example.com.csr`, `example.com.crt`,
+  `example.com.cert`, `example.com.pem`
 - **Template**: `example.com.cfg`
 - **Conversion**: `example.com.cert` (+ `example.com.pem` when `-k` is given)
 
@@ -299,10 +367,30 @@ signing time, so an existing leaf keeps whatever it was signed with.
 tests/run-all.sh        # every tests/test-*.sh; non-zero exit if any fails
 ```
 
-**45 checks.** Everything there runs as an ordinary user against temporary
-directories: what `-I` refuses, that `-o` is honoured, that the leaf is
-CA-signed and carries a SAN and the extensions above, that NSS discovery never
-returns an unexpanded glob, and that `nss_home` follows `$SUDO_USER`.
+**45 + 64 checks**, in two files. Everything runs as an ordinary user against
+temporary directories.
+
+`tests/test-install.sh` covers what `-I` refuses, that `-o` is honoured, that
+the leaf is CA-signed and carries a SAN and the extensions above, that NSS
+discovery never returns an unexpanded glob, and that `nss_home` follows
+`$SUDO_USER`.
+
+`tests/test-ca-key.sh` covers the CA key: where it lands and with which modes,
+that `-t` and `-c` move independently, that `-E` produces a key that is
+actually encrypted and can still sign a second leaf, every refusal of a bad
+passphrase source, and that a key at the old path is reused rather than
+replaced until `-R` moves it. Run against the previous commit it fails 36 of
+its checks.
+
+Its `run()` captures **both** streams, because the engine sends `msg()` to
+stdout and `wrn()`/`oerr()` to stderr: a suite watching one of them asserts on
+half the output. And every invocation has stdin closed, which is the only thing
+that makes the "`-E` with no passphrase source is refused" check mean
+anything — the bug it guards printed that refusal from inside a command
+substitution, where `execution_error` exits only the subshell. The caller then
+ran `openssl genrsa -aes256` with no passphrase argument at all, `openssl`
+prompted, took the EOF as an empty passphrase, and wrote a usable
+**unencrypted** key after saying it had refused.
 
 One part of it is about the suite rather than the tool, and exists because the
 suite used to be the bug. The `-T` acceptance checks ran `-I ca.crt -T nss`
