@@ -149,14 +149,21 @@ an Ansible vault, a password manager, another host. Both in the same directory
 is a speed bump, not a defence.
 
 The refusals are all before anything is written: a passphrase file that is
-missing, empty, or readable by others stops the run, and `-E` with no
-passphrase source and no terminal to prompt on is an error rather than a
-fallback. Without `-E`, an unencrypted CA key is created with a warning saying
+missing, empty, readable by others, or whose first line (the passphrase openssl
+reads) is shorter than 4 characters stops the run - whether it came from `-p` or
+from `YOUNGLINGS_CA_PASSPHRASE_FILE` - and `-E` with no passphrase source and no
+terminal to prompt on is an error rather than a fallback. After writing, a key
+that opens with an empty passphrase is removed. Without `-E`, an unencrypted CA key is created with a warning saying
 exactly what that means.
 
 **Already have a CA?** Its key keeps being used wherever it is, with a warning,
 because a CA that regenerated itself because the key "went missing" would
-invalidate every certificate already trusted. `-R` moves it deliberately:
+invalidate every certificate already trusted. That holds for either half: with
+only the key on disk, or only `ca.crt` (the key kept offline, or left out of a
+copy), the run is refused, naming both paths, and nothing is generated - put the
+missing file back. `-c` on an existing CA changes nothing, and says so. A leaf
+never outlives its CA: one asked for longer is cut to the CA's remaining days,
+with a warning. `-R` moves the key deliberately:
 
 ```sh
 ./ignite.sh -R -o ~/.local/share/kuat-pki     # ca.key -> ca-private/ca.key

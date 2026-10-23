@@ -103,7 +103,10 @@ if [ "$SELF_SIGNED" = "1" ]; then
     # Before any key is generated: a passphrase file that turns out to be
     # unreadable, empty or world-readable after the CA exists leaves a key
     # nothing can use, or one that is not really protected.
-    validate_passphrase_file "$CA_PASSPHRASE_FILE"
+    # The file openssl will actually read: -p, or else the environment's. Only
+    # -p was checked, so a world-readable YOUNGLINGS_CA_PASSPHRASE_FILE got
+    # past every check and a key was written (Kamino item 121).
+    validate_passphrase_file "${CA_PASSPHRASE_FILE:-${YOUNGLINGS_CA_PASSPHRASE_FILE:-}}"
     self_signed_protocol
 else
     certificate_request_protocol

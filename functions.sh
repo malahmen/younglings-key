@@ -66,7 +66,7 @@ read_parameters() {
             s) SELF_SIGNED="$OPTARG" ;;
             n) NUMBITS="$OPTARG" ;;
             t) DURATION="$OPTARG" ;;
-            c) CA_DURATION="$OPTARG" ;;
+            c) CA_DURATION="$OPTARG"; CA_DURATION_SET=1 ;;
             f) CONFIGURATION_FILE="$OPTARG" ;;
             i) SUBJECT="$OPTARG" ;;
             a) SUBJECT_CA="$OPTARG" ;;
@@ -143,6 +143,13 @@ validate_passphrase_file() {
     [ -n "$file" ] || return 0
     [ -f "$file" ] || execution_error "$ERR_CA_PASSF_FNF: $file"
     [ -s "$file" ] || execution_error "$ERR_CA_PASSF_EMPTY: $file"
+    # openssl reads the FIRST LINE as the passphrase. A file holding only a
+    # newline passed [ -s ] and gave a key that opens with an empty
+    # passphrase (Kamino item 121), and three bytes are guessable by hand.
+    local first=""
+    IFS= read -r first < "$file" || true
+    first="${first%$'\r'}"
+    [ "${#first}" -ge 4 ] || execution_error "$ERR_CA_PASSF_SHORT: $file"
     mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null || echo '')"
     case "$mode" in
         ''|*[!0-9]*) wrn "Could not read the mode of $file - check it is not world-readable." ;;
