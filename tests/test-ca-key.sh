@@ -182,5 +182,66 @@ check "name constraints present" has_ext ncenc/ca.crt 'Name Constraints'
 check "and the leaf still verifies" verifies ncenc/ca.crt ncenc/nc.lan.crt
 
 echo
+echo "--- a CA with one half missing is refused, never regenerated (Kamino 120) ---"
+sha() { openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'; }
+run -d half.lan -i '/C=PT/O=T/CN=half.lan' -o half
+key_before="$(sha half/ca-private/ca.key)"
+mv half/ca.crt half/ca.crt.aside
+run -d half2.lan -i '/C=PT/O=T/CN=half2.lan' -o half
+check "certificate missing: refused"              test "$RC" -ne 0
+check "it names both halves"                      in_out 'ca-private/ca.key.*certificate.*ca.crt'
+check "the key is untouched"                      test "$(sha half/ca-private/ca.key)" = "$key_before"
+check "no certificate was made over the gap"      test ! -e half/ca.crt
+check "no leaf was issued"                        test ! -e half/half2.lan.crt
+mv half/ca.crt.aside half/ca.crt
+crt_before="$(sha half/ca.crt)"
+mv half/ca-private/ca.key key.aside
+run -d half3.lan -i '/C=PT/O=T/CN=half3.lan' -o half
+check "key missing (kept offline): refused"       test "$RC" -ne 0
+check "it says to put the key back"               in_out 'put the key back'
+check "ca.crt is untouched"                       test "$(sha half/ca.crt)" = "$crt_before"
+check "no key was made"                           test ! -e half/ca-private/ca.key
+mv key.aside half/ca-private/ca.key
+run -d half4.lan -i '/C=PT/O=T/CN=half4.lan' -o half
+check "both halves back: the CA is reused"        test "$RC" -eq 0
+check "...and the leaf verifies against the old anchor" verifies half/ca.crt half/half4.lan.crt
+run -d leg.lan -i '/C=PT/O=T/CN=leg.lan' -o leg
+mv leg/ca-private/ca.key leg/ca.key; rmdir leg/ca-private; rm leg/ca.crt
+run -d leg2.lan -i '/C=PT/O=T/CN=leg2.lan' -o leg
+check "a key at the old path without its certificate: refused" test "$RC" -ne 0
+check "...and that key is still there"            test -f leg/ca.key
+
+echo
+echo "--- every passphrase route is checked, and a weak one refused (Kamino 121) ---"
+printf 'correct horse battery staple\n' > envloose; chmod 644 envloose
+YOUNGLINGS_CA_PASSPHRASE_FILE="$W/envloose" run -d e.lan -i '/C=PT/O=T/CN=e.lan' -o envloose -E
+check "a world-readable file through the environment: refused" test "$RC" -ne 0
+check "...before any key exists"                  test ! -e envloose/ca-private/ca.key
+printf '\n' > onlynewline; chmod 600 onlynewline
+run -d n.lan -i '/C=PT/O=T/CN=n.lan' -o nldir -E -p onlynewline
+check "a file holding only a newline: refused"    test "$RC" -ne 0
+check "...as too short"                           in_out 'shorter than 4'
+check "...before any key exists"                  test ! -e nldir/ca-private/ca.key
+printf 'abc\n' > abc; chmod 600 abc
+run -d a.lan -i '/C=PT/O=T/CN=a.lan' -o abcdir -E -p abc
+check "a three-character passphrase: refused"     test "$RC" -ne 0
+YOUNGLINGS_CA_PASSPHRASE_FILE="$W/abc" run -d a.lan -i '/C=PT/O=T/CN=a.lan' -o abcenv -E
+check "...through the environment too"            test "$RC" -ne 0
+run -d enc3.lan -i '/C=PT/O=T/CN=enc3.lan' -o enc -E -p pass
+check "the key -E made does not open without its passphrase" \
+    bash -c "! YK_EMPTY_PASS= openssl pkey -in enc/ca-private/ca.key -passin env:YK_EMPTY_PASS -noout 2>/dev/null"
+
+echo
+echo "--- a leaf never outlives its CA, and -c on an existing CA is said to do nothing ---"
+run -d short.lan -i '/C=PT/O=T/CN=short.lan' -o shortca -c 3 -t 365
+check "the run succeeds"                          test "$RC" -eq 0
+check "it says the leaf was cut to the CA's days" in_out 'The CA expires in [0-9]+ day'
+check "the leaf ends no later than the CA"        bash -c "[ \$(date -u -d \"\$(openssl x509 -in shortca/short.lan.crt -noout -enddate | cut -d= -f2)\" +%s) -le \$(date -u -d \"\$(openssl x509 -in shortca/ca.crt -noout -enddate | cut -d= -f2)\" +%s) ]"
+run -d again.lan -i '/C=PT/O=T/CN=again.lan' -o shortca -c 1000
+check "-c on an existing CA warns"                in_out '-c only applies to a CA being created'
+run -d again2.lan -i '/C=PT/O=T/CN=again2.lan' -o shortca
+check "...and without -c, no such warning"        no_out '-c only applies'
+
+echo
 if [ "$FAILED" -ne 0 ]; then echo "test-ca-key: ${FAILED} check(s) failed" >&2; exit 1; fi
 echo "test-ca-key: all checks passed"

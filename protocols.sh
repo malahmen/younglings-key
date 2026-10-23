@@ -224,6 +224,19 @@ relocate_ca_protocol() {
 
 _build_ca() {
     local ca_key; ca_key="$(_ca_key_path)"
+    # A CA with only one half on disk is refused, never regenerated (Kamino
+    # item 120). With the certificate gone, `genrsa -out` wrote over the only
+    # copy of the key behind an anchor trusted everywhere; with the key gone
+    # (kept offline, left out of a copy) a new CA silently replaced ca.crt and
+    # every certificate it had signed stopped verifying. The 10-10 rule, never
+    # regenerate a CA whose key went missing, had been applied to the legacy
+    # path only.
+    if [ -f "$ca_key" ] && [ ! -f "$(_ca_crt)" ]; then
+        execution_error "$ERR_CA_HALF_KEY: key $ca_key, certificate $(_ca_crt)"
+    fi
+    if [ ! -f "$ca_key" ] && [ -f "$(_ca_crt)" ]; then
+        execution_error "$ERR_CA_HALF_CRT: certificate $(_ca_crt), key $(_ca_key_new) (or $(_ca_key_legacy))"
+    fi
     if [ -f "$ca_key" ] && [ -f "$(_ca_crt)" ]; then
         msg "Reusing existing CA: $(_ca_crt) (delete $ca_key and ca.crt to regenerate)"
         if [ "$ca_key" = "$(_ca_key_legacy)" ]; then
@@ -234,6 +247,10 @@ _build_ca() {
             wrn "-E only applies to a CA being created; this one already exists and its key"
             wrn "is unencrypted. Encrypt it in place with:  openssl rsa -aes256 -in $ca_key -out $ca_key.enc"
         fi
+        if [ "${CA_DURATION_SET:-0}" = "1" ]; then
+            wrn "-c only applies to a CA being created; this one already exists and keeps"
+            wrn "its own validity: $(openssl x509 -in "$(_ca_crt)" -noout -enddate 2>/dev/null)"
+        fi
         return 0
     fi
 
@@ -242,6 +259,8 @@ _build_ca() {
     execute mkdir -p "$(_ca_private_dir)"
     execute chmod 700 "$(_ca_private_dir)"
     ca_key="$(_ca_key_new)"
+    # Never generate over a key, whatever the checks above concluded.
+    [ -e "$ca_key" ] && execution_error "$ERR_CA_KEY_EXISTS: $ca_key"
     if [ "$ENCRYPT_CA" = "1" ]; then
         _ca_set_pass_opts passout
         execute openssl genrsa -aes256 "${YK_PASS_OPTS[@]+${YK_PASS_OPTS[@]}}" -out "$ca_key" "$NUMBITS"
@@ -252,6 +271,16 @@ _build_ca() {
         if ! _ca_key_is_encrypted "$ca_key"; then
             rm -f "$ca_key"
             execution_error "$ERR_CA_ENC"
+        fi
+        # And it must NOT open without the passphrase: an empty one gives a
+        # file that looks encrypted and is not (Kamino item 121). An empty
+        # variable, not openssl's literal-passphrase form - the argv form this
+        # engine never builds, and which test-ca-key checks it never does -
+        # and not file:/dev/null, which opens nothing and would call every
+        # key safe.
+        if YK_EMPTY_PASS="" openssl pkey -in "$ca_key" -passin env:YK_EMPTY_PASS -noout >/dev/null 2>&1; then
+            rm -f "$ca_key"
+            execution_error "$ERR_CA_EMPTYPASS"
         fi
         msg "CA key encrypted (AES-256): $ca_key"
     else
@@ -313,6 +342,17 @@ _build_ca() {
         -key "$ca_key" \
         -out "$(_ca_crt)"
     msg "CA valid for $CA_DURATION days: $(_ca_crt)"
+}
+
+# Whole days until the CA certificate's notAfter; fails when it cannot tell.
+# GNU date first, then BSD's (macOS).
+_ca_days_left() {
+    local end end_s now_s
+    end="$(openssl x509 -in "$(_ca_crt)" -noout -enddate 2>/dev/null | cut -d= -f2)" || return 1
+    [ -n "$end" ] || return 1
+    end_s="$(date -u -d "$end" +%s 2>/dev/null || date -u -j -f '%b %e %T %Y %Z' "$end" +%s 2>/dev/null)" || return 1
+    now_s="$(date -u +%s)"
+    printf '%s' $(( (end_s - now_s) / 86400 ))
 }
 
 # SAN entry used when the CSR is built from a subject string (-i): an IPv4
@@ -445,7 +485,15 @@ _sign_with_ca() {
     ca_key="$(_ca_key_path)"
     YK_PASS_OPTS=()
     if _ca_key_is_encrypted "$ca_key"; then _ca_set_pass_opts passin; fi
-    execute openssl x509 -req -sha512 -days "$DURATION" "${ext_opts[@]}" \
+    # A leaf never outlives its CA (Kamino item 121): past the CA's notAfter
+    # it would stop verifying anyway, while looking valid.
+    local days="$DURATION" ca_left
+    if ca_left="$(_ca_days_left)" && [ "$ca_left" -lt "$days" ]; then
+        [ "$ca_left" -ge 1 ] || execution_error "$ERR_CA_EXPIRED: $(_ca_crt)"
+        wrn "The CA expires in $ca_left day(s): this certificate gets $ca_left, not $DURATION."
+        days="$ca_left"
+    fi
+    execute openssl x509 -req -sha512 -days "$days" "${ext_opts[@]}" \
         "${YK_PASS_OPTS[@]+${YK_PASS_OPTS[@]}}" \
         -CA "$(_ca_crt)" -CAkey "$ca_key" -CAcreateserial \
         -in "$CERTIFICATES_PATH/$DOMAIN.csr" \
