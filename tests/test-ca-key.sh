@@ -214,9 +214,13 @@ check "...and that key is still there"            test -f leg/ca.key
 echo
 echo "--- every passphrase route is checked, and a weak one refused (Kamino 121) ---"
 printf 'correct horse battery staple\n' > envloose; chmod 644 envloose
-YOUNGLINGS_CA_PASSPHRASE_FILE="$W/envloose" run -d e.lan -i '/C=PT/O=T/CN=e.lan' -o envloose -E
+# The output directory is NOT named after the passphrase file: it was, so
+# mkdir failed and this "refusal" passed whatever the engine did with the
+# environment's file (Kamino item 180).
+YOUNGLINGS_CA_PASSPHRASE_FILE="$W/envloose" run -d e.lan -i '/C=PT/O=T/CN=e.lan' -o envloosedir -E
 check "a world-readable file through the environment: refused" test "$RC" -ne 0
-check "...before any key exists"                  test ! -e envloose/ca-private/ca.key
+check "...for its mode"                           in_out 'mode 644'
+check "...before anything exists"                 test ! -e envloosedir
 printf '\n' > onlynewline; chmod 600 onlynewline
 run -d n.lan -i '/C=PT/O=T/CN=n.lan' -o nldir -E -p onlynewline
 check "a file holding only a newline: refused"    test "$RC" -ne 0
@@ -225,11 +229,44 @@ check "...before any key exists"                  test ! -e nldir/ca-private/ca.
 printf 'abc\n' > abc; chmod 600 abc
 run -d a.lan -i '/C=PT/O=T/CN=a.lan' -o abcdir -E -p abc
 check "a three-character passphrase: refused"     test "$RC" -ne 0
+# Three characters and a CR (a file saved on Windows): the CR is not counted.
+printf 'abc\r\n' > crlf; chmod 600 crlf
+run -d a.lan -i '/C=PT/O=T/CN=a.lan' -o crlfdir -E -p crlf
+check "'abc' with a CRLF ending: refused"         test "$RC" -ne 0
+check "...as too short"                           in_out 'shorter than 4'
+check "...before anything exists"                 test ! -e crlfdir
 YOUNGLINGS_CA_PASSPHRASE_FILE="$W/abc" run -d a.lan -i '/C=PT/O=T/CN=a.lan' -o abcenv -E
 check "...through the environment too"            test "$RC" -ne 0
 run -d enc3.lan -i '/C=PT/O=T/CN=enc3.lan' -o enc -E -p pass
 check "the key -E made does not open without its passphrase" \
     bash -c "! YK_EMPTY_PASS= openssl pkey -in enc/ca-private/ca.key -passin env:YK_EMPTY_PASS -noout 2>/dev/null"
+# The removal of a key that opens with an empty passphrase is a defence: the
+# validation above means no passphrase source reaches genrsa empty. So the
+# failure is forced - an openssl on PATH that encrypts -E's key with an empty
+# passphrase whatever it was given - to show the defence is there and works.
+REAL_OPENSSL="$(command -v openssl)"
+mkdir -p emptyshim
+cat > emptyshim/openssl <<SHIM
+#!/usr/bin/env bash
+case " \$* " in
+    *" genrsa "*"-aes256 "*)
+        args=(); skip=0
+        for a in "\$@"; do
+            if [ "\$skip" = 1 ]; then args+=("env:YK_SHIM_EMPTY"); skip=0; continue; fi
+            [ "\$a" = "-passout" ] && skip=1
+            args+=("\$a")
+        done
+        export YK_SHIM_EMPTY=""
+        exec "$REAL_OPENSSL" "\${args[@]}" ;;
+esac
+exec "$REAL_OPENSSL" "\$@"
+SHIM
+chmod +x emptyshim/openssl
+PATH="$W/emptyshim:$PATH" run -d ep.lan -i '/C=PT/O=T/CN=ep.lan' -o emptypass -E -p pass
+check "a key that opens with an empty passphrase: refused" test "$RC" -ne 0
+check "...saying so"                              in_out 'opens with an EMPTY passphrase'
+check "...and the key is removed"                 test ! -e emptypass/ca-private/ca.key
+check "...before any CA certificate"              test ! -e emptypass/ca.crt
 
 echo
 echo "--- a leaf never outlives its CA, and -c on an existing CA is said to do nothing ---"
@@ -293,6 +330,53 @@ check "...as an invalid domain"                        in_out 'Invalid domain'
 check "...and the CA key is byte-identical"            test "$(sha newl/ca-private/ca.key)" = "$nk"
 run -d keep2.lan -i '/C=PT/O=T/CN=keep2.lan' -o newl
 check "an ordinary name is still issued"               verifies newl/ca.crt newl/keep2.lan.crt
+
+echo
+echo "--- a refused re-issue changes nothing on disk (Kamino 180) ---"
+# The leaf key and CSR were written over the old ones before the signing, so a
+# refusal left the NEW key beside the OLD certificate. All of a leaf's files
+# are now written as .new and renamed only once the certificate verifies.
+leaf_sums() { local f; for f in "$1".key "$1".csr "$1".crt "$1".pem; do sha "$f"; done; }
+no_new() { ! ls "$1"/*.new "$1"/*.ext "$1"/*.ext.leaf >/dev/null 2>&1; }
+# 1. A SAN outside the CA's name constraints: signed, then refused by verify.
+run -d r.lan -i '/C=PT/O=T/CN=r.lan' -o reiss -C '.lan'
+before="$(leaf_sums reiss/r.lan)"
+cfg_out="$W/out.cfg"
+printf '[req]\nprompt=no\ndistinguished_name=dn\nreq_extensions=ext\n[dn]\nCN=r.lan\n[ext]\nsubjectAltName=DNS:r.example.com\n' > "$cfg_out"
+run -d r.lan -f "$cfg_out" -o reiss
+check "re-issue outside the constraints: refused"      test "$RC" -ne 0
+check "...key, CSR, certificate and .pem unchanged"    test "$(leaf_sums reiss/r.lan)" = "$before"
+check "...and the pair still matches"                  test "$(openssl pkey -in reiss/r.lan.key -pubout | sha /dev/stdin)" = "$(openssl x509 -in reiss/r.lan.crt -noout -pubkey | sha /dev/stdin)"
+check "...no working files left"                       no_new reiss
+# 2. The wrong CA passphrase.
+run -d w2.lan -i '/C=PT/O=T/CN=w2.lan' -o enc -E -p pass
+before="$(leaf_sums enc/w2.lan)"
+run -d w2.lan -i '/C=PT/O=T/CN=w2.lan' -o enc -E -p badpass
+check "re-issue with the wrong passphrase: refused"    test "$RC" -ne 0
+check "...key, CSR, certificate and .pem unchanged"    test "$(leaf_sums enc/w2.lan)" = "$before"
+check "...no working files left"                       no_new enc
+# 3. An expired CA: the same key, re-certified for a day in 2020 (openssl ca,
+# because req -x509 on OpenSSL 3.0 cannot set a date in the past).
+run -d x2.lan -i '/C=PT/O=T/CN=x2.lan' -o expca
+before="$(leaf_sums expca/x2.lan)"
+mkdir -p oldca; : > oldca/index; echo 01 > oldca/serial
+printf '[ca]\ndefault_ca=c\n[c]\ndatabase=oldca/index\nnew_certs_dir=oldca\nserial=oldca/serial\ndefault_md=sha256\npolicy=p\n[p]\ncommonName=supplied\n' > oldca/cfg
+openssl req -new -key expca/ca-private/ca.key -subj '/CN=old' -out oldca/req 2>/dev/null
+openssl ca -batch -notext -config oldca/cfg -selfsign -keyfile expca/ca-private/ca.key \
+    -startdate 20200101000000Z -enddate 20200102000000Z -in oldca/req -out expca/ca.crt >/dev/null 2>&1
+run -d x2.lan -i '/C=PT/O=T/CN=x2.lan' -o expca
+check "re-issue from an expired CA: refused"           test "$RC" -ne 0
+check "...as expired"                                  in_out 'has expired'
+check "...key, CSR, certificate and .pem unchanged"    test "$(leaf_sums expca/x2.lan)" = "$before"
+check "...no working files left"                       no_new expca
+# 4. CSR mode, with a config file openssl rejects.
+run -d c.lan -s 0 -i '/C=PT/O=T/CN=c.lan' -o csr
+k="$(sha csr/c.lan.key)"; c="$(sha csr/c.lan.csr)"
+printf '[req]\ndistinguished_name=nosuchsection\nprompt=no\n' > "$W/broken.cfg"
+run -d c.lan -s 0 -f "$W/broken.cfg" -o csr
+check "a CSR openssl refuses: the run fails"           test "$RC" -ne 0
+check "...and the previous key and CSR are unchanged"  test "$(sha csr/c.lan.key)$(sha csr/c.lan.csr)" = "$k$c"
+check "...no working files left"                       no_new csr
 
 echo
 if [ "$FAILED" -ne 0 ]; then echo "test-ca-key: ${FAILED} check(s) failed" >&2; exit 1; fi

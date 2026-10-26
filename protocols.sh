@@ -15,12 +15,15 @@ self_signed_protocol() {
 self_signed_protocol_configured() {
     execute mkdir -p "$CERTIFICATES_PATH"
     _build_ca
-    execute openssl genrsa -out "$CERTIFICATES_PATH/$DOMAIN.key" "$NUMBITS"
+    _leaf_begin
+    execute openssl genrsa -out "$(_leaf key.new)" "$NUMBITS"
     execute openssl req -sha512 -new \
-        -key "$CERTIFICATES_PATH/$DOMAIN.key" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.csr" \
+        -key "$(_leaf key.new)" \
+        -out "$(_leaf csr.new)" \
         -config "$CONFIGURATION_FILE"
     _sign_with_ca
+    _leaf_commit key csr crt
+    execute openssl x509 -text -noout -in "$(_leaf crt)"
     _emit_cert_and_pem
 }
 
@@ -28,12 +31,15 @@ self_signed_protocol_configured() {
 self_signed_protocol_subject() {
     execute mkdir -p "$CERTIFICATES_PATH"
     _build_ca
-    execute openssl genrsa -out "$CERTIFICATES_PATH/$DOMAIN.key" "$NUMBITS"
+    _leaf_begin
+    execute openssl genrsa -out "$(_leaf key.new)" "$NUMBITS"
     execute openssl req -sha512 -new -subj "$SUBJECT" \
         -addext "subjectAltName=$(_san_for_domain)" \
-        -key "$CERTIFICATES_PATH/$DOMAIN.key" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.csr"
+        -key "$(_leaf key.new)" \
+        -out "$(_leaf csr.new)"
     _sign_with_ca
+    _leaf_commit key csr crt
+    execute openssl x509 -text -noout -in "$(_leaf crt)"
     _emit_cert_and_pem
 }
 
@@ -49,32 +55,70 @@ certificate_request_protocol() {
 
 certificate_request_protocol_subject() {
     execute mkdir -p "$CERTIFICATES_PATH"
-    execute openssl genrsa -out "$CERTIFICATES_PATH/$DOMAIN.key" "$NUMBITS"
+    _leaf_begin
+    execute openssl genrsa -out "$(_leaf key.new)" "$NUMBITS"
     execute openssl req -sha512 -new -subj "$SUBJECT" \
         -addext "subjectAltName=$(_san_for_domain)" \
-        -key "$CERTIFICATES_PATH/$DOMAIN.key" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.csr"
-    execute openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr"
+        -key "$(_leaf key.new)" \
+        -out "$(_leaf csr.new)"
+    _leaf_commit key csr
+    execute openssl req -text -noout -in "$(_leaf csr)"
     msg "Generated CSR: $CERTIFICATES_PATH/$DOMAIN.csr (and key $DOMAIN.key)"
 }
 
 certificate_request_protocol_configured() {
     execute mkdir -p "$CERTIFICATES_PATH"
-    execute openssl genrsa -out "$CERTIFICATES_PATH/$DOMAIN.key" "$NUMBITS"
+    _leaf_begin
+    execute openssl genrsa -out "$(_leaf key.new)" "$NUMBITS"
     execute openssl req -sha512 -new \
-        -key "$CERTIFICATES_PATH/$DOMAIN.key" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.csr" \
+        -key "$(_leaf key.new)" \
+        -out "$(_leaf csr.new)" \
         -config "$CONFIGURATION_FILE"
-    execute openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr"
+    _leaf_commit key csr
+    execute openssl req -text -noout -in "$(_leaf csr)"
     msg "Generated CSR: $CERTIFICATES_PATH/$DOMAIN.csr (and key $DOMAIN.key)"
 }
+
+# ---- Leaf files: written aside, renamed together (Kamino item 180) ------------
+#
+# The key and CSR used to be written straight over $DOMAIN.key/.csr before the
+# signing, so a re-issue that was then refused - a SAN outside the CA's
+# constraints, a wrong CA passphrase, an expired CA - left the NEW key beside
+# the OLD certificate: a pair that no longer matches, on a host that was
+# working. Now every leaf file is written as .new and the set is renamed only
+# once the certificate has been verified against the CA; a refusal at any
+# point removes the .new files and leaves what was there untouched.
 
 # _leaf <suffix> - this domain's file with that suffix.
 _leaf() { printf '%s' "$CERTIFICATES_PATH/$DOMAIN.$1"; }
 
 # Every file a leaf run may write, as suffixes of $DOMAIN. refuse_ca_collision
 # checks all of them, the working files included.
-YK_LEAF_SUFFIXES=(key csr crt crt.new ext ext.leaf cert pem)
+YK_LEAF_SUFFIXES=(key key.new csr csr.new crt crt.new ext ext.leaf cert pem)
+
+YK_PENDING=()
+_discard_pending() {
+    local f
+    for f in "${YK_PENDING[@]+"${YK_PENDING[@]}"}"; do rm -f "$f"; done
+    YK_PENDING=()
+}
+
+# Arms the clean-up: execution_error exits from wherever it is, so the .new
+# files are removed by an EXIT trap rather than by every caller.
+_leaf_begin() {
+    YK_PENDING=("$(_leaf key.new)" "$(_leaf csr.new)" "$(_leaf crt.new)"
+                "$(_leaf ext)" "$(_leaf ext.leaf)")
+    trap _discard_pending EXIT
+}
+
+# _leaf_commit <suffix>... - rename each <suffix>.new over <suffix>.
+_leaf_commit() {
+    local sfx
+    for sfx in "$@"; do
+        execute mv -f "$(_leaf "$sfx.new")" "$(_leaf "$sfx")"
+    done
+    _discard_pending
+}
 
 # ---- Shared steps -------------------------------------------------------------
 
@@ -439,8 +483,8 @@ _write_leaf_extfile() {
 
 # Write an -extfile carrying the CSR's SAN (or the entry derived from -d when it has none).
 _write_san_extfile() {
-    local out="${1:?}" san
-    san=$(openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr" \
+    local out="${1:?}" csr="${2:?}" san
+    san=$(openssl req -text -noout -in "$csr" \
         | grep -A1 'Subject Alternative Name' | tail -n 1 | tr -d ' ' || true)
     [ -n "$san" ] || san=$(_san_for_domain)
     printf 'subjectAltName = %s\n' "$san" > "$out"
@@ -496,15 +540,16 @@ _verify_issued() {
 # extensions, so the SAN is carried over explicitly: -copy_extensions on
 # OpenSSL 3, an -extfile built from the CSR otherwise.
 _sign_with_ca() {
-    execute openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr"
-    local extf="$CERTIFICATES_PATH/$DOMAIN.ext"
+    local csr; csr="$(_leaf csr.new)"
+    execute openssl req -text -noout -in "$csr"
+    local extf; extf="$(_leaf ext)"
     local ext_opts=()
     if _openssl_copies_extensions; then
         # -copy_extensions carries the CSR's own extensions (the SAN, and
         # anything a -f config file added); the extfile fills in the leaf
         # extensions it did not declare. Verified that the two compose: the
         # CSR's SAN survives alongside the extfile's additions.
-        _write_leaf_extfile "$extf" "$CERTIFICATES_PATH/$DOMAIN.csr"
+        _write_leaf_extfile "$extf" "$csr"
         ext_opts=(-copy_extensions copy)
         # An empty extfile is not worth passing, and openssl need not accept one.
         [ -s "$extf" ] && ext_opts+=(-extfile "$extf")
@@ -512,8 +557,8 @@ _sign_with_ca() {
         # No -copy_extensions here, so the extfile has to carry the SAN too.
         # This path has always dropped any OTHER extension the CSR declared;
         # that is unchanged.
-        _write_san_extfile "$extf"
-        _write_leaf_extfile "${extf}.leaf" "$CERTIFICATES_PATH/$DOMAIN.csr"
+        _write_san_extfile "$extf" "$csr"
+        _write_leaf_extfile "${extf}.leaf" "$csr"
         cat "${extf}.leaf" >> "$extf"
         rm -f "${extf}.leaf"
         ext_opts=(-extfile "$extf")
@@ -534,15 +579,15 @@ _sign_with_ca() {
     execute openssl x509 -req -sha512 -days "$days" "${ext_opts[@]}" \
         "${YK_PASS_OPTS[@]+${YK_PASS_OPTS[@]}}" \
         -CA "$(_ca_crt)" -CAkey "$ca_key" -CAcreateserial \
-        -in "$CERTIFICATES_PATH/$DOMAIN.csr" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.crt.new"
+        -in "$csr" \
+        -out "$(_leaf crt.new)"
     # Before the verification, which exits on failure: otherwise a refused
     # issuance left the .ext behind, the same stray-working-file symptom Y1
     # reports for the IP path.
-    rm -f "$CERTIFICATES_PATH/$DOMAIN.ext"
-    _verify_issued "$CERTIFICATES_PATH/$DOMAIN.crt.new"
-    execute mv -f "$CERTIFICATES_PATH/$DOMAIN.crt.new" "$CERTIFICATES_PATH/$DOMAIN.crt"
-    execute openssl x509 -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.crt"
+    rm -f "$extf"
+    # Exits on a refusal; the EXIT trap then removes the .new key and CSR, so
+    # the previous key, CSR and certificate are left exactly as they were.
+    _verify_issued "$(_leaf crt.new)"
 }
 
 # From $DOMAIN.crt (+ .key) produce the .cert and .pem convenience files.

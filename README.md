@@ -148,13 +148,24 @@ That is only worth doing if the passphrase lives somewhere the key does not —
 an Ansible vault, a password manager, another host. Both in the same directory
 is a speed bump, not a defence.
 
-The refusals are all before anything is written: a passphrase file that is
-missing, empty, readable by others, or whose first line (the passphrase openssl
-reads) is shorter than 4 characters stops the run - whether it came from `-p` or
-from `YOUNGLINGS_CA_PASSPHRASE_FILE` - and `-E` with no passphrase source and no
-terminal to prompt on is an error rather than a fallback. After writing, a key
-that opens with an empty passphrase is removed. Without `-E`, an unencrypted CA key is created with a warning saying
-exactly what that means.
+The passphrase refusals are all before anything is written: a passphrase file
+that is missing, empty, readable by others, or whose first line (the passphrase
+openssl reads; a trailing CR is not counted) is shorter than 4 characters stops
+the run - whether it came from `-p` or from `YOUNGLINGS_CA_PASSPHRASE_FILE` -
+and `-E` with no passphrase source and no terminal to prompt on is an error
+rather than a fallback. After writing, a key that opens with an empty
+passphrase is removed; that is a defence behind the length check, which no
+passphrase source gets past, and the suite proves it by forcing it. Without
+`-E`, an unencrypted CA key is created with a warning saying exactly what that
+means.
+
+A leaf that is refused later - its names outside the CA's constraints, a wrong
+CA passphrase, an expired CA, a CSR openssl rejects - changes nothing either.
+The key, CSR and certificate are written as `.new` files and renamed over the
+previous ones only once the CA is shown to vouch for the certificate; a
+refusal removes the `.new` files, so a re-issue that fails leaves the working
+key and certificate exactly as they were. (`ca.srl`, the CA's serial counter,
+may still have moved on: a serial is never reused, which is the point of it.)
 
 **Already have a CA?** Its key keeps being used wherever it is, with a warning,
 because a CA that regenerated itself because the key "went missing" would
