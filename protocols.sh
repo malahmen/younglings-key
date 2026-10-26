@@ -111,11 +111,14 @@ _leaf_begin() {
     trap _discard_pending EXIT
 }
 
-# _leaf_commit <suffix>... - rename each <suffix>.new over <suffix>.
+# _leaf_commit <suffix>... - rename each <suffix>.new over <suffix>. The key
+# keeps the 0600 it was created with (umask 077, set by ignite.sh); the public
+# halves are made 0644, as they were before the umask.
 _leaf_commit() {
     local sfx
     for sfx in "$@"; do
         execute mv -f "$(_leaf "$sfx.new")" "$(_leaf "$sfx")"
+        [ "$sfx" = key ] || execute chmod 644 "$(_leaf "$sfx")"
     done
     _discard_pending
 }
@@ -125,7 +128,11 @@ _leaf_commit() {
 # Create the CA once; later runs sign with it so already-trusted certs stay
 # valid. Delete ca.key and ca.crt to get a fresh CA.
 # True when `openssl req` supports -addext (OpenSSL >= 1.1.1, LibreSSL >= 3.1).
-_openssl_has_addext() { openssl req -help 2>&1 | grep -q -- '-addext'; }
+# A here-string, not a pipe: under pipefail `openssl ... | grep -q` fails
+# whenever grep exits on its match before openssl has finished writing
+# (SIGPIPE, 141) - and a false "no -addext" here builds a CA with no
+# basicConstraints or keyUsage at all (Kamino item 198).
+_openssl_has_addext() { grep -q -- '-addext' <<<"$(openssl req -help 2>&1)"; }
 
 # _cidr_to_netmask <prefix-length> — 16 -> 255.255.0.0
 _cidr_to_netmask() {
@@ -252,6 +259,8 @@ _ca_key_is_encrypted() {
 # passphrase somewhere else (an ansible vault, a password manager), so that
 # taking the key is not enough on its own.
 _ca_pass_arg() {
+    # Read once from a pipe by validate_passphrase_file (functions.sh).
+    if [ "${YK_CA_PASS_FROM_PIPE:-0}" = "1" ]; then printf 'env:YK_CA_PASS'; return 0; fi
     if [ -n "$CA_PASSPHRASE_FILE" ]; then printf 'file:%s' "$CA_PASSPHRASE_FILE"; return 0; fi
     if [ -n "${YOUNGLINGS_CA_PASSPHRASE_FILE:-}" ]; then
         printf 'file:%s' "$YOUNGLINGS_CA_PASSPHRASE_FILE"; return 0
@@ -423,18 +432,26 @@ _build_ca() {
         "${YK_PASS_OPTS[@]+${YK_PASS_OPTS[@]}}" \
         -key "$ca_key" \
         -out "$(_ca_crt)"
+    # Public, and read by other tools by path: 0644 as before the umask.
+    execute chmod 644 "$(_ca_crt)"
     msg "CA valid for $CA_DURATION days: $(_ca_crt)"
 }
 
 # Whole days until the CA certificate's notAfter; fails when it cannot tell.
 # GNU date first, then BSD's (macOS).
+#
+# Five minutes short of it: this is measured a moment BEFORE openssl signs,
+# and -days counts from the signing. Measured in the same second the CA was
+# made, a 3-day CA gave 3, the signing landed a second later, and the leaf
+# outlived its CA by that second - which the suite, once it could read the
+# dates on macOS, caught (Kamino item 198).
 _ca_days_left() {
     local end end_s now_s
     end="$(openssl x509 -in "$(_ca_crt)" -noout -enddate 2>/dev/null | cut -d= -f2)" || return 1
     [ -n "$end" ] || return 1
     end_s="$(date -u -d "$end" +%s 2>/dev/null || date -u -j -f '%b %e %T %Y %Z' "$end" +%s 2>/dev/null)" || return 1
     now_s="$(date -u +%s)"
-    printf '%s' $(( (end_s - now_s) / 86400 ))
+    printf '%s' $(( (end_s - now_s - 300) / 86400 ))
 }
 
 # SAN entry used when the CSR is built from a subject string (-i): an IPv4
@@ -473,11 +490,11 @@ _write_leaf_extfile() {
     local out="${1:?}" csr="${2:?}" txt
     txt="$(openssl req -text -noout -in "$csr" 2>/dev/null || true)"
     : > "$out"
-    printf '%s' "$txt" | grep -q 'X509v3 Basic Constraints' \
+    grep -q 'X509v3 Basic Constraints' <<<"$txt" \
         || echo 'basicConstraints = critical, CA:FALSE' >> "$out"
-    printf '%s' "$txt" | grep -q 'X509v3 Key Usage' \
+    grep -q 'X509v3 Key Usage' <<<"$txt" \
         || echo 'keyUsage = critical, digitalSignature, keyEncipherment' >> "$out"
-    printf '%s' "$txt" | grep -q 'X509v3 Extended Key Usage' \
+    grep -q 'X509v3 Extended Key Usage' <<<"$txt" \
         || echo 'extendedKeyUsage = serverAuth, clientAuth' >> "$out"
 }
 
@@ -594,6 +611,7 @@ _sign_with_ca() {
 _emit_cert_and_pem() {
     execute openssl x509 -inform PEM -in "$CERTIFICATES_PATH/$DOMAIN.crt" \
         -out "$CERTIFICATES_PATH/$DOMAIN.cert"
+    execute chmod 644 "$CERTIFICATES_PATH/$DOMAIN.cert"
     _write_pem "$CERTIFICATES_PATH/$DOMAIN.key" "$CERTIFICATES_PATH/$DOMAIN.crt" \
         "$CERTIFICATES_PATH/$DOMAIN.pem"
     msg "Generated: $DOMAIN.crt, $DOMAIN.cert, $DOMAIN.pem in $CERTIFICATES_PATH/"
@@ -638,6 +656,7 @@ generate_files_from_crt_protocol() {
 
     execute openssl x509 -text -noout -in "$crt_path"
     execute openssl x509 -inform PEM -in "$crt_path" -out "$CERTIFICATES_PATH/$DOMAIN.cert"
+    execute chmod 644 "$CERTIFICATES_PATH/$DOMAIN.cert"
     msg "Generated: $CERTIFICATES_PATH/$DOMAIN.cert"
 
     if [ -n "$PRIVATE_KEY" ]; then
@@ -686,6 +705,7 @@ generate_configuration_file_template_protocol() {
 	$alt_names
 	# Add more DNS.n / IP.n entries as needed.
 	EOF
+    execute chmod 644 "$out"
     msg "Template written: $out"
 }
 
@@ -737,8 +757,7 @@ _install_system_store() {
     # certificate they are about to trust.
     msg "Installing into: $dest"
     openssl x509 -noout -subject -issuer -dates -in "$INSTALL_FILE" 1>&2 || true
-    if ! openssl x509 -noout -ext basicConstraints -in "$INSTALL_FILE" 2>/dev/null \
-            | grep -q 'CA:TRUE'; then
+    if ! grep -q 'CA:TRUE' <<<"$(openssl x509 -noout -ext basicConstraints -in "$INSTALL_FILE" 2>/dev/null)"; then
         wrn "This certificate is not a CA (no basicConstraints CA:TRUE). Installing"
         wrn "it trusts exactly this certificate, not anything it signed."
     fi

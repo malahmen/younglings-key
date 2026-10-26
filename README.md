@@ -148,6 +148,19 @@ That is only worth doing if the passphrase lives somewhere the key does not —
 an Ansible vault, a password manager, another host. Both in the same directory
 is a speed bump, not a defence.
 
+The passphrase can come straight out of a password manager, without a copy on
+disk:
+
+```sh
+./ignite.sh -d 'host.lan' -i '/C=PT/O=Acme/CN=host.lan' -E -p <(pass show ca)
+```
+
+A pipe like that (or a named FIFO) can be read only once and openssl needs the
+passphrase up to three times, so its first line is read once and handed to
+openssl through the environment (`env:`), which only the owner and root can
+read - never through `argv`. A symlink to a passphrase file is judged by the
+file it points to. A pipe has no mode to check; a file does.
+
 The passphrase refusals are all before anything is written: a passphrase file
 that is missing, empty, readable by others, or whose first line (the passphrase
 openssl reads; a trailing CR is not counted) is shorter than 4 characters stops
@@ -362,8 +375,13 @@ For a domain `example.com`, `./certificates/` will contain, depending on the mod
 - **Conversion**: `example.com.cert` (+ `example.com.pem` when `-k` is given)
 
 `ca.srl` is the CA's serial-number counter, maintained by `openssl` across runs.
-`.pem` bundles contain the **private key** followed by the certificate, so they are
-written with `0600` permissions — keep them out of version control.
+Every key - the leaf's `.key`, the `.pem` bundle (the **private key** followed
+by the certificate), the CA key - is written `0600`: the whole run works under
+`umask 077`, because LibreSSL (macOS's `/usr/bin/openssl`) wrote leaf keys
+`0644`. Certificates, CSRs and templates are public and stay `0644`. A new
+output directory is `0700`. Keep keys out of version control. (`-I` and `-U`
+run under your own umask: they rebuild the system's CA bundles, which have to
+stay world-readable.)
 
 ### What a signed leaf carries
 
@@ -394,7 +412,7 @@ signing time, so an existing leaf keeps whatever it was signed with.
 tests/run-all.sh        # every tests/test-*.sh; non-zero exit if any fails
 ```
 
-**45 + 64 checks**, in two files. Everything runs as an ordinary user against
+**45 + 160 checks**, in two files. Everything runs as an ordinary user against
 temporary directories.
 
 `tests/test-install.sh` covers what `-I` refuses, that `-o` is honoured, that
@@ -407,7 +425,18 @@ that `-t` and `-c` move independently, that `-E` produces a key that is
 actually encrypted and can still sign a second leaf, every refusal of a bad
 passphrase source, and that a key at the old path is reused rather than
 replaced until `-R` moves it. Run against the previous commit it fails 36 of
-its checks.
+its checks. Since Kamino items 163, 180 and 198 it also covers that no leaf
+lands on the CA's files in either layout (CSR mode and `CA`/`Ca` included, the
+CA key and certificate compared byte for byte), that a refused re-issue
+changes nothing on disk, that a symlinked or piped passphrase works, and that
+keys are `0600`; against the engine before them it fails 39 checks on Linux.
+
+Certificate dates are read with GNU `date`, or BSD's on macOS. Where neither
+can read them those checks are skipped, saying so - they used to compare two
+empty strings, which `[ -le ]` calls true. Output is matched with
+here-strings, never `printf | grep -q`: under `pipefail` grep exits on its
+match, the writer dies of SIGPIPE, and the check fails on output that matched
+(or, negated, passes on it).
 
 Its `run()` captures **both** streams, because the engine sends `msg()` to
 stdout and `wrn()`/`oerr()` to stderr: a suite watching one of them asserts on

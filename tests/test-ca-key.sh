@@ -20,8 +20,9 @@ W="$(mktemp -d)"
 trap 'rm -rf "$W"' EXIT
 cd "$W" || exit 1
 
-FAILED=0
+FAILED=0; SKIPPED=0
 ok()  { printf '  PASS  %s\n' "$1"; }
+skip() { printf '  SKIP  %s\n' "$1"; SKIPPED=$((SKIPPED + 1)); }
 bad() { printf '  FAIL  %s\n' "$1" >&2; FAILED=$((FAILED + 1)); }
 check() { local d="$1"; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
 # Colour stripped so assertions match with or without a TTY; stdin closed so a
@@ -32,20 +33,53 @@ check() { local d="$1"; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
 # an "it said so" check passes or fails for the wrong reason.
 OUTPUT=""; RC=0
 run() { OUTPUT="$(bash "$ENGINE" "$@" </dev/null 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g')"; RC=${PIPESTATUS[0]}; }
-in_out() { printf '%s' "$OUTPUT" | grep -qE -- "$1"; }
-no_out() { ! printf '%s' "$OUTPUT" | grep -qE -- "$1"; }
+# Here-strings, not `printf | grep -q`: under pipefail grep -q exits on its
+# match, printf dies of SIGPIPE writing the rest, and the pipeline fails - so
+# in_out failed on output that matched and no_out PASSED on it (17 of 500 runs
+# on a 6 KB output; Kamino item 198).
+in_out() { grep -qE -- "$1" <<<"$OUTPUT"; }
+no_out() { ! grep -qE -- "$1" <<<"$OUTPUT"; }
 mode_is() { [ "$(stat -c '%a' "$2" 2>/dev/null || stat -f '%Lp' "$2")" = "$1" ]; }
 # openssl verify prints "file: OK" on stdout; the suite only wants the status.
 verifies() { openssl verify -CAfile "$1" "$2" >/dev/null 2>&1; }
-has_ext() { openssl x509 -in "$1" -noout -text 2>/dev/null | grep -q -- "$2"; }
+# The key opens with the passphrase in this file (stdin closed: no prompt).
+opens_with() { openssl pkey -in "$1" -passin "file:$2" -noout </dev/null >/dev/null 2>&1; }
+has_ext() { grep -q -- "$2" <<<"$(openssl x509 -in "$1" -noout -text 2>/dev/null)"; }
+sha() { openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'; }
+# A certificate date as epoch seconds: GNU date, else BSD's (macOS). Fails -
+# never prints an empty string that a numeric test would wave through - when
+# neither can read it. The leaf-ends-before-its-CA check used to compare two
+# empty `date -d` results on macOS, `[ -le ]`, which is true (Kamino 198).
+to_epoch() {
+    local t
+    t=$(date -u -d "$1" +%s 2>/dev/null || date -u -j -f '%b %e %T %Y %Z' "$1" +%s 2>/dev/null) || return 1
+    [ -n "$t" ] || return 1
+    printf '%s' "$t"
+}
+cert_date() { to_epoch "$(openssl x509 -in "$2" -noout "-$1" | cut -d= -f2)"; }
+HAVE_DATE=0; to_epoch 'Jan  1 00:00:00 2030 GMT' >/dev/null && HAVE_DATE=1
+# check, for a check that needs to read certificate dates: skipped, and said
+# so, on a system whose date can do neither.
+dated() {
+    local d="$1"; shift
+    if [ "$HAVE_DATE" = 1 ]; then check "$d" "$@"
+    else skip "$d (this date reads neither -d nor -j -f)"; fi
+}
 # A certificate's lifetime in days, from its own notBefore/notAfter.
 lifetime_days() {
-    local f="$1" nb na
-    nb=$(date -u -d "$(openssl x509 -in "$f" -noout -startdate | cut -d= -f2)" +%s 2>/dev/null) || return 1
-    na=$(date -u -d "$(openssl x509 -in "$f" -noout -enddate   | cut -d= -f2)" +%s 2>/dev/null) || return 1
+    local nb na
+    nb=$(cert_date startdate "$1") || return 1
+    na=$(cert_date enddate "$1") || return 1
     echo $(( (na - nb) / 86400 ))
 }
 days_is() { [ "$(lifetime_days "$2")" = "$1" ]; }
+# ends_by <a.crt> <b.crt> - a's notAfter is no later than b's.
+ends_by() {
+    local a b
+    a=$(cert_date enddate "$1") || return 1
+    b=$(cert_date enddate "$2") || return 1
+    [ "$a" -le "$b" ]
+}
 
 printf 'correct horse battery staple\n' > pass; chmod 600 pass
 
@@ -68,11 +102,11 @@ echo
 echo "--- leaf and CA lifetimes are separate ---"
 # They shared one value, so a leaf short enough for Apple platforms to accept
 # would also have shortened the root — which means re-distributing the anchor.
-check "the leaf lasts 398 days"  days_is 398 plain/one.lan.crt
-check "the CA lasts 3650 days"   days_is 3650 plain/ca.crt
+dated "the leaf lasts 398 days"  days_is 398 plain/one.lan.crt
+dated "the CA lasts 3650 days"   days_is 3650 plain/ca.crt
 run -d two.lan -i '/C=PT/O=T/CN=two.lan' -o split -t 30 -c 60
-check "-t sets the leaf"  days_is 30 split/two.lan.crt
-check "-c sets the CA"    days_is 60 split/ca.crt
+dated "-t sets the leaf"  days_is 30 split/two.lan.crt
+dated "-c sets the CA"    days_is 60 split/ca.crt
 run -d bad.lan -i '/C=PT/O=T/CN=bad.lan' -o cbad -c 99999
 check "-c past the ceiling is refused"  test "$RC" -eq 1
 check "with the range in the message"   in_out '7300'
@@ -183,7 +217,6 @@ check "and the leaf still verifies" verifies ncenc/ca.crt ncenc/nc.lan.crt
 
 echo
 echo "--- a CA with one half missing is refused, never regenerated (Kamino 120) ---"
-sha() { openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'; }
 run -d half.lan -i '/C=PT/O=T/CN=half.lan' -o half
 key_before="$(sha half/ca-private/ca.key)"
 mv half/ca.crt half/ca.crt.aside
@@ -273,7 +306,7 @@ echo "--- a leaf never outlives its CA, and -c on an existing CA is said to do n
 run -d short.lan -i '/C=PT/O=T/CN=short.lan' -o shortca -c 3 -t 365
 check "the run succeeds"                          test "$RC" -eq 0
 check "it says the leaf was cut to the CA's days" in_out 'The CA expires in [0-9]+ day'
-check "the leaf ends no later than the CA"        bash -c "[ \$(date -u -d \"\$(openssl x509 -in shortca/short.lan.crt -noout -enddate | cut -d= -f2)\" +%s) -le \$(date -u -d \"\$(openssl x509 -in shortca/ca.crt -noout -enddate | cut -d= -f2)\" +%s) ]"
+dated "the leaf ends no later than the CA"        ends_by shortca/short.lan.crt shortca/ca.crt
 run -d again.lan -i '/C=PT/O=T/CN=again.lan' -o shortca -c 1000
 check "-c on an existing CA warns"                in_out '-c only applies to a CA being created'
 run -d again2.lan -i '/C=PT/O=T/CN=again2.lan' -o shortca
@@ -379,5 +412,38 @@ check "...and the previous key and CSR are unchanged"  test "$(sha csr/c.lan.key
 check "...no working files left"                       no_new csr
 
 echo
+echo "--- the recommended passphrase set-ups work, and keys are 0600 (Kamino 198) ---"
+ln -s "$W/pass" passlink
+run -d sl.lan -i '/C=PT/O=T/CN=sl.lan' -o symenc -E -p passlink
+check "a symlink to a 0600 passphrase file: accepted"  test "$RC" -eq 0
+check "...and the key is encrypted"                    grep -q 'ENCRYPTED' symenc/ca-private/ca.key
+ln -s "$W/loose" looselink
+run -d sl.lan -i '/C=PT/O=T/CN=sl.lan' -o symloose -E -p looselink
+check "a symlink to a 0644 file: refused, for its mode" in_out 'mode 644'
+run -d pp.lan -i '/C=PT/O=T/CN=pp.lan' -o pipeenc -E -p <(cat "$W/pass")
+check "-p <(...) (a pipe): accepted"                   test "$RC" -eq 0
+check "...the key is encrypted"                        grep -q 'ENCRYPTED' pipeenc/ca-private/ca.key
+check "...with the passphrase's first line"            opens_with pipeenc/ca-private/ca.key "$W/pass"
+check "...and the leaf verifies"                       verifies pipeenc/ca.crt pipeenc/pp.lan.crt
+run -d pp2.lan -i '/C=PT/O=T/CN=pp2.lan' -o pipeenc -p <(cat "$W/pass")
+check "a second leaf, the passphrase through a pipe"   verifies pipeenc/ca.crt pipeenc/pp2.lan.crt
+mkfifo fifo
+# The writer's streams are not the suite's, so a writer left blocked cannot
+# hold the caller's pipe open; opening the FIFO read-write afterwards releases
+# it whether or not the engine read it.
+(cat "$W/pass" > fifo 2>/dev/null </dev/null &) >/dev/null 2>&1
+YOUNGLINGS_CA_PASSPHRASE_FILE="$W/fifo" run -d pf.lan -i '/C=PT/O=T/CN=pf.lan' -o pipeenc
+check "a named FIFO through the environment"           verifies pipeenc/ca.crt pipeenc/pf.lan.crt
+exec 7<>fifo; exec 7>&-
+run -d ps.lan -i '/C=PT/O=T/CN=ps.lan' -o pipeshort -E -p <(printf 'abc\n')
+check "a short passphrase through a pipe: refused"     in_out 'shorter than 4'
+check "...before anything exists"                      test ! -e pipeshort
+check "a leaf key is 0600"                             mode_is 600 plain/one.lan.key
+check "its .pem is 0600"                               mode_is 600 plain/one.lan.pem
+check "its certificate stays 0644"                     mode_is 644 plain/one.lan.crt
+check "and so does ca.crt"                             mode_is 644 plain/ca.crt
+
+echo
 if [ "$FAILED" -ne 0 ]; then echo "test-ca-key: ${FAILED} check(s) failed" >&2; exit 1; fi
-echo "test-ca-key: all checks passed"
+if [ "$SKIPPED" -ne 0 ]; then echo "test-ca-key: all checks passed, ${SKIPPED} skipped"
+else echo "test-ca-key: all checks passed"; fi
