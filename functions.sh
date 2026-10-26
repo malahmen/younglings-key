@@ -97,6 +97,10 @@ is_ipv4() { printf '%s' "${1:-}" | grep -Eq "$re_ipv4"; }
 validate_domain() {
     local domain="${1:-}"
     [ -z "$domain" ] && parameter_missing_error "$ERR_DN_NS"
+    # grep matches LINE by line, so a domain with a newline in it passed when
+    # any one of its lines did - and the whole value, '/' and '..' included,
+    # then went into the output paths (Kamino item 163).
+    case "$domain" in *[[:space:]]*) execution_error "$ERR_DN_I" ;; esac
     if printf '%s' "$domain" | grep -Eq '^[0-9.]+$'; then
         is_ipv4 "$domain" || execution_error "$ERR_DN_I"    # all-numeric: must be a real IPv4
     elif ! printf '%s' "$domain" | grep -Eq "$re_hostname"; then

@@ -313,7 +313,16 @@ what was intended.
 
 **Domains** (`-d`) may be a regular hostname (`example.com`, `sub.example.com`),
 `localhost` or any other single-label host (`myhost`), a wildcard (`*.example.com`),
-or a dotted-quad IPv4 address (`192.168.1.10`). Anything else is rejected.
+or a dotted-quad IPv4 address (`192.168.1.10`). Anything else is rejected,
+whitespace and newlines included.
+
+A domain whose files would land on the CA's is refused before anything is
+written: `-d ca` (or `CA`, `Ca` - the same file on a case-insensitive disk)
+would put its key at `ca.key`, the CA key in the older layout, and its
+certificate over `ca.crt`. The check is on the paths, not the name: every file
+a run may write for the domain is compared with `ca.key`, `ca-private/`,
+`ca.crt` and `ca.srl`, and a leaf file that is a link to one of them is refused
+too.
 
 **Subject strings** are a run of `/Key=Value` pairs in any order and must include at
 least `/C=`, `/O=`, and `/CN=` (e.g. `/C=PT/ST=Lisboa/O=Acme/OU=IT/CN=example.com`).

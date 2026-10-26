@@ -243,5 +243,57 @@ run -d again2.lan -i '/C=PT/O=T/CN=again2.lan' -o shortca
 check "...and without -c, no such warning"        no_out '-c only applies'
 
 echo
+echo "--- a leaf never lands on the CA's files (Kamino 163) ---"
+# The domain 'ca' wrote its key over a legacy <out>/ca.key (genrsa -out) and
+# its certificate over ca.crt. Every leaf output is checked against every CA
+# path, in both layouts, ignoring case; CSR mode (-s 0) has no CA step at all
+# and used to exit 0 having replaced the key.
+run -d keep.lan -i '/C=PT/O=T/CN=keep.lan' -o newl
+mkdir -p legl
+cp newl/ca.crt legl/ca.crt; cp newl/ca-private/ca.key legl/ca.key
+nk="$(sha newl/ca-private/ca.key)"; nc="$(sha newl/ca.crt)"
+lk="$(sha legl/ca.key)";            lc="$(sha legl/ca.crt)"
+for d in ca CA Ca; do
+    for mode in "-s 1" "-s 0"; do
+        # shellcheck disable=SC2086 # $mode is two words on purpose
+        run -d "$d" $mode -i "/C=PT/O=T/CN=$d" -o newl
+        check "new layout, -d $d $mode: refused"            test "$RC" -ne 0
+        check "...naming the CA's file"                      in_out "the CA's"
+        # shellcheck disable=SC2086
+        run -d "$d" $mode -i "/C=PT/O=T/CN=$d" -o legl
+        check "legacy layout, -d $d $mode: refused"         test "$RC" -ne 0
+    done
+done
+cfg_ca="$W/ca.cfg"
+printf '[req]\nprompt=no\ndistinguished_name=dn\n[dn]\nCN=ca\n' > "$cfg_ca"
+run -d ca -s 0 -f "$cfg_ca" -o legl
+check "legacy layout, -d ca -s 0 -f: refused"          test "$RC" -ne 0
+check "new layout: the CA key is byte-identical"       test "$(sha newl/ca-private/ca.key)" = "$nk"
+check "new layout: ca.crt is byte-identical"           test "$(sha newl/ca.crt)" = "$nc"
+check "new layout: nothing at the legacy key path"     test ! -e newl/ca.key
+check "legacy layout: the CA key is byte-identical"    test "$(sha legl/ca.key)" = "$lk"
+check "legacy layout: ca.crt is byte-identical"        test "$(sha legl/ca.crt)" = "$lc"
+check "no leaf working files left"                     bash -c '! ls newl/*.new legl/*.new 2>/dev/null | grep -q .'
+run -d ca -i '/C=PT/O=T/CN=ca' -o noca
+check "with no CA yet, -d ca: refused"                 test "$RC" -ne 0
+check "...before anything is written"                  test ! -e noca
+# By identity, not only by name: a leaf file that IS a CA file through a link.
+ln -s ca-private/ca.key newl/link.lan.pem
+run -d link.lan -i '/C=PT/O=T/CN=link.lan' -o newl
+check "a leaf output linked to the CA key: refused"    test "$RC" -ne 0
+check "...and the CA key is byte-identical"            test "$(sha newl/ca-private/ca.key)" = "$nk"
+rm -f newl/link.lan.pem
+# grep matches line by line: a domain with a newline passed when one line did.
+mkdir -p "newl/x.lan
+"
+run -d "x.lan
+/../ca" -s 0 -i '/C=PT/O=T/CN=x' -o newl
+check "a domain with a newline in it: refused"         test "$RC" -ne 0
+check "...as an invalid domain"                        in_out 'Invalid domain'
+check "...and the CA key is byte-identical"            test "$(sha newl/ca-private/ca.key)" = "$nk"
+run -d keep2.lan -i '/C=PT/O=T/CN=keep2.lan' -o newl
+check "an ordinary name is still issued"               verifies newl/ca.crt newl/keep2.lan.crt
+
+echo
 if [ "$FAILED" -ne 0 ]; then echo "test-ca-key: ${FAILED} check(s) failed" >&2; exit 1; fi
 echo "test-ca-key: all checks passed"

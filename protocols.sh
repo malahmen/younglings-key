@@ -69,6 +69,13 @@ certificate_request_protocol_configured() {
     msg "Generated CSR: $CERTIFICATES_PATH/$DOMAIN.csr (and key $DOMAIN.key)"
 }
 
+# _leaf <suffix> - this domain's file with that suffix.
+_leaf() { printf '%s' "$CERTIFICATES_PATH/$DOMAIN.$1"; }
+
+# Every file a leaf run may write, as suffixes of $DOMAIN. refuse_ca_collision
+# checks all of them, the working files included.
+YK_LEAF_SUFFIXES=(key csr crt crt.new ext ext.leaf cert pem)
+
 # ---- Shared steps -------------------------------------------------------------
 
 # Create the CA once; later runs sign with it so already-trusted certs stay
@@ -141,6 +148,37 @@ _ca_private_dir() { printf '%s' "$CERTIFICATES_PATH/ca-private"; }
 _ca_key_new()     { printf '%s' "$(_ca_private_dir)/ca.key"; }
 _ca_key_legacy()  { printf '%s' "$CERTIFICATES_PATH/ca.key"; }
 _ca_crt()         { printf '%s' "$CERTIFICATES_PATH/ca.crt"; }
+# openssl x509 -CAcreateserial names the serial file after the CA certificate.
+_ca_srl()         { printf '%s' "$CERTIFICATES_PATH/ca.srl"; }
+
+# _lower <string> - tr, not ${x,,}: that is bash 4, and macOS's /bin/bash is 3.2.
+_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# refuse_ca_collision <suffix>... - stop, before anything is written, when any
+# file this run would write for $DOMAIN is one of the CA's (Kamino item 163).
+#
+# The domain `ca` was accepted, and its leaf key went to <out>/ca.key - the
+# CA key in the old layout, which `genrsa -out` then replaced - and its
+# certificate to <out>/ca.crt, replacing the anchor with a CA:FALSE leaf. The
+# guard against regenerating a CA (item 120) protected the CA's paths from the
+# CA step only. So the TARGETS are checked, not the name: every leaf output
+# path against every CA path, in both layouts, ignoring case (a
+# case-insensitive filesystem makes CA.key the same file as ca.key), and by
+# identity where both exist (-ef: a symlink or hard link to a CA file).
+refuse_ca_collision() {
+    local sfx leaf ca lc_leaf lc_ca
+    local ca_paths=("$(_ca_key_new)" "$(_ca_key_legacy)" "$(_ca_crt)" "$(_ca_srl)" "$(_ca_private_dir)")
+    for sfx in "$@"; do
+        leaf="$(_leaf "$sfx")"; lc_leaf="$(_lower "$leaf")"
+        for ca in "${ca_paths[@]}"; do
+            lc_ca="$(_lower "$ca")"
+            if [ "$lc_leaf" = "$lc_ca" ] || [[ "$lc_leaf" == "$lc_ca"/* ]] \
+               || { [ -e "$leaf" ] && [ -e "$ca" ] && [ "$leaf" -ef "$ca" ]; }; then
+                execution_error "$ERR_DN_CA: -d $DOMAIN would write $leaf, which is the CA's $ca"
+            fi
+        done
+    done
+}
 
 # The CA key in use: the protected location if it is there, the old one
 # otherwise, and the protected one for a CA that does not exist yet.

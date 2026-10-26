@@ -64,6 +64,7 @@ fi
 # Chosen by providing -r <crt> (and optionally -k <key> for the .pem).
 if [ -n "$CRT_FILE" ]; then
     validate_domain "$DOMAIN"                 # used for the output filenames
+    refuse_ca_collision cert pem              # before anything is written
     generate_file_protocol "$PEM_AND_CERT_FILES"
     exit 0
 fi
@@ -80,12 +81,17 @@ validate_name_constraints "$NAME_CONSTRAINTS" # -C, before any key is generated
 # ---- Mode 2: emit a .cfg template and exit ------------------------------------
 validate_template_flag "$TEMPLATE"
 if [ "$TEMPLATE" = "1" ]; then
+    refuse_ca_collision cfg
     generate_file_protocol "$CONFIGURATION_FILE_TEMPLATE"
     exit 0
 fi
 
 # ---- Mode 3: self-signed certificate or CSR -----------------------------------
 validate_self_signed "$SELF_SIGNED"
+# A leaf must never land on the CA's files (Kamino item 163): `-d ca` wrote
+# its key over a legacy <out>/ca.key and its certificate over ca.crt. Checked
+# for every file either mode may write, before the CA step and before any key.
+refuse_ca_collision "${YK_LEAF_SUFFIXES[@]}"
 
 # Subject source: a config file (-f) OR a subject string (-i), not neither.
 if [ -n "$CONFIGURATION_FILE" ]; then
