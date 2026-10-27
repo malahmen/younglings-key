@@ -15,12 +15,15 @@ self_signed_protocol() {
 self_signed_protocol_configured() {
     execute mkdir -p "$CERTIFICATES_PATH"
     _build_ca
-    execute openssl genrsa -out "$CERTIFICATES_PATH/$DOMAIN.key" "$NUMBITS"
+    _leaf_begin
+    execute openssl genrsa -out "$(_leaf key.new)" "$NUMBITS"
     execute openssl req -sha512 -new \
-        -key "$CERTIFICATES_PATH/$DOMAIN.key" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.csr" \
+        -key "$(_leaf key.new)" \
+        -out "$(_leaf csr.new)" \
         -config "$CONFIGURATION_FILE"
     _sign_with_ca
+    _leaf_commit key csr crt
+    execute openssl x509 -text -noout -in "$(_leaf crt)"
     _emit_cert_and_pem
 }
 
@@ -28,12 +31,15 @@ self_signed_protocol_configured() {
 self_signed_protocol_subject() {
     execute mkdir -p "$CERTIFICATES_PATH"
     _build_ca
-    execute openssl genrsa -out "$CERTIFICATES_PATH/$DOMAIN.key" "$NUMBITS"
+    _leaf_begin
+    execute openssl genrsa -out "$(_leaf key.new)" "$NUMBITS"
     execute openssl req -sha512 -new -subj "$SUBJECT" \
         -addext "subjectAltName=$(_san_for_domain)" \
-        -key "$CERTIFICATES_PATH/$DOMAIN.key" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.csr"
+        -key "$(_leaf key.new)" \
+        -out "$(_leaf csr.new)"
     _sign_with_ca
+    _leaf_commit key csr crt
+    execute openssl x509 -text -noout -in "$(_leaf crt)"
     _emit_cert_and_pem
 }
 
@@ -49,24 +55,72 @@ certificate_request_protocol() {
 
 certificate_request_protocol_subject() {
     execute mkdir -p "$CERTIFICATES_PATH"
-    execute openssl genrsa -out "$CERTIFICATES_PATH/$DOMAIN.key" "$NUMBITS"
+    _leaf_begin
+    execute openssl genrsa -out "$(_leaf key.new)" "$NUMBITS"
     execute openssl req -sha512 -new -subj "$SUBJECT" \
         -addext "subjectAltName=$(_san_for_domain)" \
-        -key "$CERTIFICATES_PATH/$DOMAIN.key" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.csr"
-    execute openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr"
+        -key "$(_leaf key.new)" \
+        -out "$(_leaf csr.new)"
+    _leaf_commit key csr
+    execute openssl req -text -noout -in "$(_leaf csr)"
     msg "Generated CSR: $CERTIFICATES_PATH/$DOMAIN.csr (and key $DOMAIN.key)"
 }
 
 certificate_request_protocol_configured() {
     execute mkdir -p "$CERTIFICATES_PATH"
-    execute openssl genrsa -out "$CERTIFICATES_PATH/$DOMAIN.key" "$NUMBITS"
+    _leaf_begin
+    execute openssl genrsa -out "$(_leaf key.new)" "$NUMBITS"
     execute openssl req -sha512 -new \
-        -key "$CERTIFICATES_PATH/$DOMAIN.key" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.csr" \
+        -key "$(_leaf key.new)" \
+        -out "$(_leaf csr.new)" \
         -config "$CONFIGURATION_FILE"
-    execute openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr"
+    _leaf_commit key csr
+    execute openssl req -text -noout -in "$(_leaf csr)"
     msg "Generated CSR: $CERTIFICATES_PATH/$DOMAIN.csr (and key $DOMAIN.key)"
+}
+
+# ---- Leaf files: written aside, renamed together (Kamino item 180) ------------
+#
+# The key and CSR used to be written straight over $DOMAIN.key/.csr before the
+# signing, so a re-issue that was then refused - a SAN outside the CA's
+# constraints, a wrong CA passphrase, an expired CA - left the NEW key beside
+# the OLD certificate: a pair that no longer matches, on a host that was
+# working. Now every leaf file is written as .new and the set is renamed only
+# once the certificate has been verified against the CA; a refusal at any
+# point removes the .new files and leaves what was there untouched.
+
+# _leaf <suffix> - this domain's file with that suffix.
+_leaf() { printf '%s' "$CERTIFICATES_PATH/$DOMAIN.$1"; }
+
+# Every file a leaf run may write, as suffixes of $DOMAIN. refuse_ca_collision
+# checks all of them, the working files included.
+YK_LEAF_SUFFIXES=(key key.new csr csr.new crt crt.new ext ext.leaf cert pem)
+
+YK_PENDING=()
+_discard_pending() {
+    local f
+    for f in "${YK_PENDING[@]+"${YK_PENDING[@]}"}"; do rm -f "$f"; done
+    YK_PENDING=()
+}
+
+# Arms the clean-up: execution_error exits from wherever it is, so the .new
+# files are removed by an EXIT trap rather than by every caller.
+_leaf_begin() {
+    YK_PENDING=("$(_leaf key.new)" "$(_leaf csr.new)" "$(_leaf crt.new)"
+                "$(_leaf ext)" "$(_leaf ext.leaf)")
+    trap _discard_pending EXIT
+}
+
+# _leaf_commit <suffix>... - rename each <suffix>.new over <suffix>. The key
+# keeps the 0600 it was created with (umask 077, set by ignite.sh); the public
+# halves are made 0644, as they were before the umask.
+_leaf_commit() {
+    local sfx
+    for sfx in "$@"; do
+        execute mv -f "$(_leaf "$sfx.new")" "$(_leaf "$sfx")"
+        [ "$sfx" = key ] || execute chmod 644 "$(_leaf "$sfx")"
+    done
+    _discard_pending
 }
 
 # ---- Shared steps -------------------------------------------------------------
@@ -74,7 +128,11 @@ certificate_request_protocol_configured() {
 # Create the CA once; later runs sign with it so already-trusted certs stay
 # valid. Delete ca.key and ca.crt to get a fresh CA.
 # True when `openssl req` supports -addext (OpenSSL >= 1.1.1, LibreSSL >= 3.1).
-_openssl_has_addext() { openssl req -help 2>&1 | grep -q -- '-addext'; }
+# A here-string, not a pipe: under pipefail `openssl ... | grep -q` fails
+# whenever grep exits on its match before openssl has finished writing
+# (SIGPIPE, 141) - and a false "no -addext" here builds a CA with no
+# basicConstraints or keyUsage at all (Kamino item 198).
+_openssl_has_addext() { grep -q -- '-addext' <<<"$(openssl req -help 2>&1)"; }
 
 # _cidr_to_netmask <prefix-length> — 16 -> 255.255.0.0
 _cidr_to_netmask() {
@@ -141,6 +199,37 @@ _ca_private_dir() { printf '%s' "$CERTIFICATES_PATH/ca-private"; }
 _ca_key_new()     { printf '%s' "$(_ca_private_dir)/ca.key"; }
 _ca_key_legacy()  { printf '%s' "$CERTIFICATES_PATH/ca.key"; }
 _ca_crt()         { printf '%s' "$CERTIFICATES_PATH/ca.crt"; }
+# openssl x509 -CAcreateserial names the serial file after the CA certificate.
+_ca_srl()         { printf '%s' "$CERTIFICATES_PATH/ca.srl"; }
+
+# _lower <string> - tr, not ${x,,}: that is bash 4, and macOS's /bin/bash is 3.2.
+_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# refuse_ca_collision <suffix>... - stop, before anything is written, when any
+# file this run would write for $DOMAIN is one of the CA's (Kamino item 163).
+#
+# The domain `ca` was accepted, and its leaf key went to <out>/ca.key - the
+# CA key in the old layout, which `genrsa -out` then replaced - and its
+# certificate to <out>/ca.crt, replacing the anchor with a CA:FALSE leaf. The
+# guard against regenerating a CA (item 120) protected the CA's paths from the
+# CA step only. So the TARGETS are checked, not the name: every leaf output
+# path against every CA path, in both layouts, ignoring case (a
+# case-insensitive filesystem makes CA.key the same file as ca.key), and by
+# identity where both exist (-ef: a symlink or hard link to a CA file).
+refuse_ca_collision() {
+    local sfx leaf ca lc_leaf lc_ca
+    local ca_paths=("$(_ca_key_new)" "$(_ca_key_legacy)" "$(_ca_crt)" "$(_ca_srl)" "$(_ca_private_dir)")
+    for sfx in "$@"; do
+        leaf="$(_leaf "$sfx")"; lc_leaf="$(_lower "$leaf")"
+        for ca in "${ca_paths[@]}"; do
+            lc_ca="$(_lower "$ca")"
+            if [ "$lc_leaf" = "$lc_ca" ] || [[ "$lc_leaf" == "$lc_ca"/* ]] \
+               || { [ -e "$leaf" ] && [ -e "$ca" ] && [ "$leaf" -ef "$ca" ]; }; then
+                execution_error "$ERR_DN_CA: -d $DOMAIN would write $leaf, which is the CA's $ca"
+            fi
+        done
+    done
+}
 
 # The CA key in use: the protected location if it is there, the old one
 # otherwise, and the protected one for a CA that does not exist yet.
@@ -170,6 +259,8 @@ _ca_key_is_encrypted() {
 # passphrase somewhere else (an ansible vault, a password manager), so that
 # taking the key is not enough on its own.
 _ca_pass_arg() {
+    # Read once from a pipe by validate_passphrase_file (functions.sh).
+    if [ "${YK_CA_PASS_FROM_PIPE:-0}" = "1" ]; then printf 'env:YK_CA_PASS'; return 0; fi
     if [ -n "$CA_PASSPHRASE_FILE" ]; then printf 'file:%s' "$CA_PASSPHRASE_FILE"; return 0; fi
     if [ -n "${YOUNGLINGS_CA_PASSPHRASE_FILE:-}" ]; then
         printf 'file:%s' "$YOUNGLINGS_CA_PASSPHRASE_FILE"; return 0
@@ -341,18 +432,26 @@ _build_ca() {
         "${YK_PASS_OPTS[@]+${YK_PASS_OPTS[@]}}" \
         -key "$ca_key" \
         -out "$(_ca_crt)"
+    # Public, and read by other tools by path: 0644 as before the umask.
+    execute chmod 644 "$(_ca_crt)"
     msg "CA valid for $CA_DURATION days: $(_ca_crt)"
 }
 
 # Whole days until the CA certificate's notAfter; fails when it cannot tell.
 # GNU date first, then BSD's (macOS).
+#
+# Five minutes short of it: this is measured a moment BEFORE openssl signs,
+# and -days counts from the signing. Measured in the same second the CA was
+# made, a 3-day CA gave 3, the signing landed a second later, and the leaf
+# outlived its CA by that second - which the suite, once it could read the
+# dates on macOS, caught (Kamino item 198).
 _ca_days_left() {
     local end end_s now_s
     end="$(openssl x509 -in "$(_ca_crt)" -noout -enddate 2>/dev/null | cut -d= -f2)" || return 1
     [ -n "$end" ] || return 1
     end_s="$(date -u -d "$end" +%s 2>/dev/null || date -u -j -f '%b %e %T %Y %Z' "$end" +%s 2>/dev/null)" || return 1
     now_s="$(date -u +%s)"
-    printf '%s' $(( (end_s - now_s) / 86400 ))
+    printf '%s' $(( (end_s - now_s - 300) / 86400 ))
 }
 
 # SAN entry used when the CSR is built from a subject string (-i): an IPv4
@@ -391,18 +490,18 @@ _write_leaf_extfile() {
     local out="${1:?}" csr="${2:?}" txt
     txt="$(openssl req -text -noout -in "$csr" 2>/dev/null || true)"
     : > "$out"
-    printf '%s' "$txt" | grep -q 'X509v3 Basic Constraints' \
+    grep -q 'X509v3 Basic Constraints' <<<"$txt" \
         || echo 'basicConstraints = critical, CA:FALSE' >> "$out"
-    printf '%s' "$txt" | grep -q 'X509v3 Key Usage' \
+    grep -q 'X509v3 Key Usage' <<<"$txt" \
         || echo 'keyUsage = critical, digitalSignature, keyEncipherment' >> "$out"
-    printf '%s' "$txt" | grep -q 'X509v3 Extended Key Usage' \
+    grep -q 'X509v3 Extended Key Usage' <<<"$txt" \
         || echo 'extendedKeyUsage = serverAuth, clientAuth' >> "$out"
 }
 
 # Write an -extfile carrying the CSR's SAN (or the entry derived from -d when it has none).
 _write_san_extfile() {
-    local out="${1:?}" san
-    san=$(openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr" \
+    local out="${1:?}" csr="${2:?}" san
+    san=$(openssl req -text -noout -in "$csr" \
         | grep -A1 'Subject Alternative Name' | tail -n 1 | tr -d ' ' || true)
     [ -n "$san" ] || san=$(_san_for_domain)
     printf 'subjectAltName = %s\n' "$san" > "$out"
@@ -458,15 +557,16 @@ _verify_issued() {
 # extensions, so the SAN is carried over explicitly: -copy_extensions on
 # OpenSSL 3, an -extfile built from the CSR otherwise.
 _sign_with_ca() {
-    execute openssl req -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.csr"
-    local extf="$CERTIFICATES_PATH/$DOMAIN.ext"
+    local csr; csr="$(_leaf csr.new)"
+    execute openssl req -text -noout -in "$csr"
+    local extf; extf="$(_leaf ext)"
     local ext_opts=()
     if _openssl_copies_extensions; then
         # -copy_extensions carries the CSR's own extensions (the SAN, and
         # anything a -f config file added); the extfile fills in the leaf
         # extensions it did not declare. Verified that the two compose: the
         # CSR's SAN survives alongside the extfile's additions.
-        _write_leaf_extfile "$extf" "$CERTIFICATES_PATH/$DOMAIN.csr"
+        _write_leaf_extfile "$extf" "$csr"
         ext_opts=(-copy_extensions copy)
         # An empty extfile is not worth passing, and openssl need not accept one.
         [ -s "$extf" ] && ext_opts+=(-extfile "$extf")
@@ -474,8 +574,8 @@ _sign_with_ca() {
         # No -copy_extensions here, so the extfile has to carry the SAN too.
         # This path has always dropped any OTHER extension the CSR declared;
         # that is unchanged.
-        _write_san_extfile "$extf"
-        _write_leaf_extfile "${extf}.leaf" "$CERTIFICATES_PATH/$DOMAIN.csr"
+        _write_san_extfile "$extf" "$csr"
+        _write_leaf_extfile "${extf}.leaf" "$csr"
         cat "${extf}.leaf" >> "$extf"
         rm -f "${extf}.leaf"
         ext_opts=(-extfile "$extf")
@@ -496,21 +596,22 @@ _sign_with_ca() {
     execute openssl x509 -req -sha512 -days "$days" "${ext_opts[@]}" \
         "${YK_PASS_OPTS[@]+${YK_PASS_OPTS[@]}}" \
         -CA "$(_ca_crt)" -CAkey "$ca_key" -CAcreateserial \
-        -in "$CERTIFICATES_PATH/$DOMAIN.csr" \
-        -out "$CERTIFICATES_PATH/$DOMAIN.crt.new"
+        -in "$csr" \
+        -out "$(_leaf crt.new)"
     # Before the verification, which exits on failure: otherwise a refused
     # issuance left the .ext behind, the same stray-working-file symptom Y1
     # reports for the IP path.
-    rm -f "$CERTIFICATES_PATH/$DOMAIN.ext"
-    _verify_issued "$CERTIFICATES_PATH/$DOMAIN.crt.new"
-    execute mv -f "$CERTIFICATES_PATH/$DOMAIN.crt.new" "$CERTIFICATES_PATH/$DOMAIN.crt"
-    execute openssl x509 -text -noout -in "$CERTIFICATES_PATH/$DOMAIN.crt"
+    rm -f "$extf"
+    # Exits on a refusal; the EXIT trap then removes the .new key and CSR, so
+    # the previous key, CSR and certificate are left exactly as they were.
+    _verify_issued "$(_leaf crt.new)"
 }
 
 # From $DOMAIN.crt (+ .key) produce the .cert and .pem convenience files.
 _emit_cert_and_pem() {
     execute openssl x509 -inform PEM -in "$CERTIFICATES_PATH/$DOMAIN.crt" \
         -out "$CERTIFICATES_PATH/$DOMAIN.cert"
+    execute chmod 644 "$CERTIFICATES_PATH/$DOMAIN.cert"
     _write_pem "$CERTIFICATES_PATH/$DOMAIN.key" "$CERTIFICATES_PATH/$DOMAIN.crt" \
         "$CERTIFICATES_PATH/$DOMAIN.pem"
     msg "Generated: $DOMAIN.crt, $DOMAIN.cert, $DOMAIN.pem in $CERTIFICATES_PATH/"
@@ -555,6 +656,7 @@ generate_files_from_crt_protocol() {
 
     execute openssl x509 -text -noout -in "$crt_path"
     execute openssl x509 -inform PEM -in "$crt_path" -out "$CERTIFICATES_PATH/$DOMAIN.cert"
+    execute chmod 644 "$CERTIFICATES_PATH/$DOMAIN.cert"
     msg "Generated: $CERTIFICATES_PATH/$DOMAIN.cert"
 
     if [ -n "$PRIVATE_KEY" ]; then
@@ -603,6 +705,7 @@ generate_configuration_file_template_protocol() {
 	$alt_names
 	# Add more DNS.n / IP.n entries as needed.
 	EOF
+    execute chmod 644 "$out"
     msg "Template written: $out"
 }
 
@@ -654,8 +757,7 @@ _install_system_store() {
     # certificate they are about to trust.
     msg "Installing into: $dest"
     openssl x509 -noout -subject -issuer -dates -in "$INSTALL_FILE" 1>&2 || true
-    if ! openssl x509 -noout -ext basicConstraints -in "$INSTALL_FILE" 2>/dev/null \
-            | grep -q 'CA:TRUE'; then
+    if ! grep -q 'CA:TRUE' <<<"$(openssl x509 -noout -ext basicConstraints -in "$INSTALL_FILE" 2>/dev/null)"; then
         wrn "This certificate is not a CA (no basicConstraints CA:TRUE). Installing"
         wrn "it trusts exactly this certificate, not anything it signed."
     fi

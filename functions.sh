@@ -89,17 +89,26 @@ read_parameters() {
     done
 }
 
+# The validators below match with here-strings, not `printf | grep -q`: under
+# pipefail a grep that exits on its match before the writer has finished gets
+# the writer killed by SIGPIPE and the pipeline reports failure for a value
+# that matched (Kamino item 198).
+
 # Function: is $1 a dotted-quad IPv4 address?
-is_ipv4() { printf '%s' "${1:-}" | grep -Eq "$re_ipv4"; }
+is_ipv4() { grep -Eq "$re_ipv4" <<<"${1:-}"; }
 
 # Function: validate a domain: hostname (example.com, localhost, myhost),
 # wildcard (*.example.com) or IPv4 address.
 validate_domain() {
     local domain="${1:-}"
     [ -z "$domain" ] && parameter_missing_error "$ERR_DN_NS"
-    if printf '%s' "$domain" | grep -Eq '^[0-9.]+$'; then
+    # grep matches LINE by line, so a domain with a newline in it passed when
+    # any one of its lines did - and the whole value, '/' and '..' included,
+    # then went into the output paths (Kamino item 163).
+    case "$domain" in *[[:space:]]*) execution_error "$ERR_DN_I" ;; esac
+    if grep -Eq '^[0-9.]+$' <<<"$domain"; then
         is_ipv4 "$domain" || execution_error "$ERR_DN_I"    # all-numeric: must be a real IPv4
-    elif ! printf '%s' "$domain" | grep -Eq "$re_hostname"; then
+    elif ! grep -Eq "$re_hostname" <<<"$domain"; then
         execution_error "$ERR_DN_I"
     fi
 }
@@ -108,20 +117,20 @@ validate_domain() {
 validate_template_flag() {
     local flag="${1:-}"
     [ -z "$flag" ] && parameter_missing_error "$ERR_TPLF_NS"
-    printf '%s' "$flag" | grep -qE '^[01]$' || execution_error "$ERR_TPLF_I"
+    grep -qE '^[01]$' <<<"$flag" || execution_error "$ERR_TPLF_I"
 }
 
 # Function: validate the self-signed flag (must be 0 or 1).
 validate_self_signed() {
     local flag="${1:-}"
     [ -z "$flag" ] && parameter_missing_error "$ERR_SSF_NS"
-    printf '%s' "$flag" | grep -qE '^[01]$' || execution_error "$ERR_SSF_I"
+    grep -qE '^[01]$' <<<"$flag" || execution_error "$ERR_SSF_I"
 }
 
 # Function: validate the RSA key size.
 validate_numbits() {
     local numbits="${1:-}"
-    printf '%s' "$numbits" | grep -Eq '^(2048|3072|4096)$' || execution_error "$ERR_BN_I"
+    grep -Eq '^(2048|3072|4096)$' <<<"$numbits" || execution_error "$ERR_BN_I"
 }
 
 # Function: validate the CA duration (integer days, 1-7300).
@@ -129,7 +138,7 @@ validate_numbits() {
 # shortening it means re-distributing the anchor, not because it is safer.
 validate_ca_duration() {
     local days="${1:-}"
-    if ! printf '%s' "$days" | grep -Eq '^[0-9]+$'; then execution_error "$ERR_CAD_I"; fi
+    if ! grep -Eq '^[0-9]+$' <<<"$days"; then execution_error "$ERR_CAD_I"; fi
     if [ "$days" -lt 1 ] || [ "$days" -gt 7300 ]; then execution_error "$ERR_CAD_I"; fi
 }
 
@@ -138,19 +147,40 @@ validate_ca_duration() {
 # The mode is checked, not just the existence: a passphrase file anyone can
 # read turns the encryption into decoration, and this is the one place that
 # can notice before a key is written.
+#
+# A symlink is judged by the file it points to (stat -L): the link's own mode
+# is always 777 and said nothing. A pipe - `-p <(pass show ca)`, the set-up
+# the README recommends, or a named FIFO - has no mode worth checking and can
+# be read only ONCE, while openssl needs the passphrase up to three times
+# (genrsa, req, x509). So its first line is read here, once, and handed to
+# openssl through the environment (env:YK_CA_PASS) - never argv, which every
+# process on the machine can read; a process's environment is readable only by
+# its owner and root (Kamino item 198).
+YK_CA_PASS_FROM_PIPE=0
 validate_passphrase_file() {
-    local file="${1:-}" mode
+    local file="${1:-}" mode first=""
     [ -n "$file" ] || return 0
+    if [ -p "$file" ]; then
+        IFS= read -r first < "$file" || true
+        # The same rule as a file (Kamino item 121), on the same first line.
+        local stripped="${first%$'\r'}"
+        [ "${#stripped}" -ge 4 ] || execution_error "$ERR_CA_PASSF_SHORT: $file"
+        # What openssl's file: reader would have used: the first line, its
+        # newline dropped and nothing else, so a key made through a pipe opens
+        # with the same file later.
+        export YK_CA_PASS="$first"
+        YK_CA_PASS_FROM_PIPE=1
+        return 0
+    fi
     [ -f "$file" ] || execution_error "$ERR_CA_PASSF_FNF: $file"
     [ -s "$file" ] || execution_error "$ERR_CA_PASSF_EMPTY: $file"
     # openssl reads the FIRST LINE as the passphrase. A file holding only a
     # newline passed [ -s ] and gave a key that opens with an empty
     # passphrase (Kamino item 121), and three bytes are guessable by hand.
-    local first=""
     IFS= read -r first < "$file" || true
     first="${first%$'\r'}"
     [ "${#first}" -ge 4 ] || execution_error "$ERR_CA_PASSF_SHORT: $file"
-    mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null || echo '')"
+    mode="$(stat -L -c '%a' "$file" 2>/dev/null || stat -L -f '%Lp' "$file" 2>/dev/null || echo '')"
     case "$mode" in
         ''|*[!0-9]*) wrn "Could not read the mode of $file - check it is not world-readable." ;;
         *) if [ "$(( 8#$mode & 8#077 ))" -ne 0 ]; then
@@ -162,7 +192,7 @@ validate_passphrase_file() {
 # Function: validate the certificate duration (integer days, 1-3650).
 validate_duration() {
     local days="${1:-}"
-    if ! printf '%s' "$days" | grep -Eq '^[0-9]+$'; then execution_error "$ERR_CD_I"; fi
+    if ! grep -Eq '^[0-9]+$' <<<"$days"; then execution_error "$ERR_CD_I"; fi
     if [ "$days" -lt 1 ] || [ "$days" -gt 3650 ]; then execution_error "$ERR_CD_I"; fi
 }
 
@@ -175,13 +205,13 @@ validate_configuration_file() {
 }
 
 # Function: is field $2 present in string $1 (fixed-string match).
-is_present() { printf '%s' "$1" | grep -qF "$2"; }
+is_present() { grep -qF "$2" <<<"$1"; }
 
 # Function: validate a subject string (any field order; needs /C=, /O=, /CN=).
 validate_subject() {
     local subject="${1:-}"
     [ -z "$subject" ] && execution_error "$ERR_SS_I"
-    printf '%s' "$subject" | grep -Eq "$re_subject" || execution_error "$ERR_SS_I"
+    grep -Eq "$re_subject" <<<"$subject" || execution_error "$ERR_SS_I"
     if ! is_present "$subject" "/C=" || ! is_present "$subject" "/O=" || ! is_present "$subject" "/CN="; then
         execution_error "$ERR_SS_MI"
     fi
@@ -284,13 +314,13 @@ validate_name_constraints() {
         case "$entry" in
             */*)
                 addr="${entry%%/*}"; bits="${entry##*/}"
-                printf '%s' "$addr" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+                grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' <<<"$addr" \
                     || parameter_missing_error "$ERR_NC: ${entry}"
-                printf '%s' "$bits" | grep -qE '^([0-9]|[12][0-9]|3[0-2]|([0-9]{1,3}\.){3}[0-9]{1,3})$' \
+                grep -qE '^([0-9]|[12][0-9]|3[0-2]|([0-9]{1,3}\.){3}[0-9]{1,3})$' <<<"$bits" \
                     || parameter_missing_error "$ERR_NC: ${entry}"
                 ;;
             *)
-                printf '%s' "$entry" | grep -qE '^\.?([A-Za-z0-9*_-]+\.)*[A-Za-z0-9*_-]+$' \
+                grep -qE '^\.?([A-Za-z0-9*_-]+\.)*[A-Za-z0-9*_-]+$' <<<"$entry" \
                     || parameter_missing_error "$ERR_NC: ${entry}"
                 ;;
         esac

@@ -148,13 +148,37 @@ That is only worth doing if the passphrase lives somewhere the key does not —
 an Ansible vault, a password manager, another host. Both in the same directory
 is a speed bump, not a defence.
 
-The refusals are all before anything is written: a passphrase file that is
-missing, empty, readable by others, or whose first line (the passphrase openssl
-reads) is shorter than 4 characters stops the run - whether it came from `-p` or
-from `YOUNGLINGS_CA_PASSPHRASE_FILE` - and `-E` with no passphrase source and no
-terminal to prompt on is an error rather than a fallback. After writing, a key
-that opens with an empty passphrase is removed. Without `-E`, an unencrypted CA key is created with a warning saying
-exactly what that means.
+The passphrase can come straight out of a password manager, without a copy on
+disk:
+
+```sh
+./ignite.sh -d 'host.lan' -i '/C=PT/O=Acme/CN=host.lan' -E -p <(pass show ca)
+```
+
+A pipe like that (or a named FIFO) can be read only once and openssl needs the
+passphrase up to three times, so its first line is read once and handed to
+openssl through the environment (`env:`), which only the owner and root can
+read - never through `argv`. A symlink to a passphrase file is judged by the
+file it points to. A pipe has no mode to check; a file does.
+
+The passphrase refusals are all before anything is written: a passphrase file
+that is missing, empty, readable by others, or whose first line (the passphrase
+openssl reads; a trailing CR is not counted) is shorter than 4 characters stops
+the run - whether it came from `-p` or from `YOUNGLINGS_CA_PASSPHRASE_FILE` -
+and `-E` with no passphrase source and no terminal to prompt on is an error
+rather than a fallback. After writing, a key that opens with an empty
+passphrase is removed; that is a defence behind the length check, which no
+passphrase source gets past, and the suite proves it by forcing it. Without
+`-E`, an unencrypted CA key is created with a warning saying exactly what that
+means.
+
+A leaf that is refused later - its names outside the CA's constraints, a wrong
+CA passphrase, an expired CA, a CSR openssl rejects - changes nothing either.
+The key, CSR and certificate are written as `.new` files and renamed over the
+previous ones only once the CA is shown to vouch for the certificate; a
+refusal removes the `.new` files, so a re-issue that fails leaves the working
+key and certificate exactly as they were. (`ca.srl`, the CA's serial counter,
+may still have moved on: a serial is never reused, which is the point of it.)
 
 **Already have a CA?** Its key keeps being used wherever it is, with a warning,
 because a CA that regenerated itself because the key "went missing" would
@@ -313,7 +337,16 @@ what was intended.
 
 **Domains** (`-d`) may be a regular hostname (`example.com`, `sub.example.com`),
 `localhost` or any other single-label host (`myhost`), a wildcard (`*.example.com`),
-or a dotted-quad IPv4 address (`192.168.1.10`). Anything else is rejected.
+or a dotted-quad IPv4 address (`192.168.1.10`). Anything else is rejected,
+whitespace and newlines included.
+
+A domain whose files would land on the CA's is refused before anything is
+written: `-d ca` (or `CA`, `Ca` - the same file on a case-insensitive disk)
+would put its key at `ca.key`, the CA key in the older layout, and its
+certificate over `ca.crt`. The check is on the paths, not the name: every file
+a run may write for the domain is compared with `ca.key`, `ca-private/`,
+`ca.crt` and `ca.srl`, and a leaf file that is a link to one of them is refused
+too.
 
 **Subject strings** are a run of `/Key=Value` pairs in any order and must include at
 least `/C=`, `/O=`, and `/CN=` (e.g. `/C=PT/ST=Lisboa/O=Acme/OU=IT/CN=example.com`).
@@ -342,8 +375,13 @@ For a domain `example.com`, `./certificates/` will contain, depending on the mod
 - **Conversion**: `example.com.cert` (+ `example.com.pem` when `-k` is given)
 
 `ca.srl` is the CA's serial-number counter, maintained by `openssl` across runs.
-`.pem` bundles contain the **private key** followed by the certificate, so they are
-written with `0600` permissions — keep them out of version control.
+Every key - the leaf's `.key`, the `.pem` bundle (the **private key** followed
+by the certificate), the CA key - is written `0600`: the whole run works under
+`umask 077`, because LibreSSL (macOS's `/usr/bin/openssl`) wrote leaf keys
+`0644`. Certificates, CSRs and templates are public and stay `0644`. A new
+output directory is `0700`. Keep keys out of version control. (`-I` and `-U`
+run under your own umask: they rebuild the system's CA bundles, which have to
+stay world-readable.)
 
 ### What a signed leaf carries
 
@@ -374,7 +412,7 @@ signing time, so an existing leaf keeps whatever it was signed with.
 tests/run-all.sh        # every tests/test-*.sh; non-zero exit if any fails
 ```
 
-**45 + 64 checks**, in two files. Everything runs as an ordinary user against
+**45 + 160 checks**, in two files. Everything runs as an ordinary user against
 temporary directories.
 
 `tests/test-install.sh` covers what `-I` refuses, that `-o` is honoured, that
@@ -387,7 +425,18 @@ that `-t` and `-c` move independently, that `-E` produces a key that is
 actually encrypted and can still sign a second leaf, every refusal of a bad
 passphrase source, and that a key at the old path is reused rather than
 replaced until `-R` moves it. Run against the previous commit it fails 36 of
-its checks.
+its checks. Since Kamino items 163, 180 and 198 it also covers that no leaf
+lands on the CA's files in either layout (CSR mode and `CA`/`Ca` included, the
+CA key and certificate compared byte for byte), that a refused re-issue
+changes nothing on disk, that a symlinked or piped passphrase works, and that
+keys are `0600`; against the engine before them it fails 39 checks on Linux.
+
+Certificate dates are read with GNU `date`, or BSD's on macOS. Where neither
+can read them those checks are skipped, saying so - they used to compare two
+empty strings, which `[ -le ]` calls true. Output is matched with
+here-strings, never `printf | grep -q`: under `pipefail` grep exits on its
+match, the writer dies of SIGPIPE, and the check fails on output that matched
+(or, negated, passes on it).
 
 Its `run()` captures **both** streams, because the engine sends `msg()` to
 stdout and `wrn()`/`oerr()` to stderr: a suite watching one of them asserts on
